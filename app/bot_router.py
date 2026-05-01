@@ -9,7 +9,6 @@ from .config import settings
 logger = logging.getLogger(__name__)
 extella = ExtellaClient(settings.extella_token)
 
-# Default intent when user sends media without caption
 _DEFAULT_INTENT = {
     "photo":    "обработай это изображение",
     "video":    "опиши это видео",
@@ -17,8 +16,6 @@ _DEFAULT_INTENT = {
     "audio":    "транскрибируй этот аудиофайл",
     "document": "обработай этот документ",
 }
-
-# Telegram chat action per media type
 _CHAT_ACTION = {
     "text":     "typing",
     "photo":    "upload_photo",
@@ -27,8 +24,6 @@ _CHAT_ACTION = {
     "audio":    "upload_voice",
     "document": "upload_document",
 }
-
-# Extella search enrichment keywords per media type
 _MEDIA_SEARCH_HINT = {
     "photo":    "image photo visual processing",
     "video":    "video processing",
@@ -60,16 +55,15 @@ async def handle_user_bot_update(token_hash: str, data: dict):
 async def _process(user_tg, bot, msg: dict, session):
     chat_id = msg["chat"]["id"]
 
-    # ── Extract text & media ──────────────────────────────────────────────
-    raw_text  = msg.get("text",    "").strip()
-    caption   = msg.get("caption", "").strip()
+    raw_text = msg.get("text",    "").strip()
+    caption  = msg.get("caption", "").strip()
 
     media_type = "text"
     file_id    = None
 
     if msg.get("photo"):
         media_type = "photo"
-        file_id    = msg["photo"][-1]["file_id"]   # largest resolution
+        file_id    = msg["photo"][-1]["file_id"]
     elif msg.get("video"):
         media_type = "video"
         file_id    = msg["video"]["file_id"]
@@ -83,68 +77,61 @@ async def _process(user_tg, bot, msg: dict, session):
         media_type = "document"
         file_id    = msg["document"]["file_id"]
 
-    # Effective text: caption wins for media, raw_text for pure text
     text = caption or raw_text
     if not text and media_type != "text":
         text = _DEFAULT_INTENT[media_type]
     if not text:
-        return  # empty message, ignore
+        return
 
-    # ── Load active experts ───────────────────────────────────────────────
     experts = (await session.execute(
         select(BotExpert)
         .where(BotExpert.bot_id == bot.id, BotExpert.is_active == True)
         .order_by(BotExpert.sort_order)
     )).scalars().all()
 
-    # ── System commands ───────────────────────────────────────────────────
     if raw_text in ("/start", "/help"):
-        lines = "\n".join(f"\u2022 {e.display_name or e.expert_name}" for e in experts)
-        capabilities = (
-            "\n\u{1F4AC} Текст \u2014 вопросы, переводы, посты\n"
-            "\U0001F5BC Фото \u2014 обработка изображений\n"
-            "\U0001F3A4 Голосовые \u2014 транскрипция речи\n"
-            "\U0001F3B5 Аудио \u2014 транскрипция файлов\n"
-            "\U0001F4C4 Документы \u2014 анализ и обработка"
-        )
-        await user_tg.send_message(
-            chat_id,
-            f"\U0001F44B Привет! Этот бот работает на базе <b>Extella AI</b>.\n\n"
-            f"<b>Функций: {len(experts)}</b>\n{lines}\n\n"
-            f"<b>Умею обрабатывать:</b>{capabilities}\n\n"
-            "Просто отправь что нужно!"
-            if experts else
-            "\U0001F44B Бот настраивается. Скоро всё заработает!"
-        )
+        if experts:
+            lines = "\n".join(f"\u2022 {e.display_name or e.expert_name}" for e in experts)
+            caps = (
+                "\n\U0001f4ac Текст \u2014 вопросы, переводы, посты"
+                "\n\U0001f5bc\ufe0f Фото \u2014 обработка изображений"
+                "\n\U0001f3a4 Голосовые \u2014 транскрипция речи"
+                "\n\U0001f3b5 Аудио \u2014 транскрипция файлов"
+                "\n\U0001f4c4 Документы \u2014 анализ и обработка"
+            )
+            await user_tg.send_message(
+                chat_id,
+                f"\U0001f44b Привет! Этот бот работает на базе <b>Extella AI</b>.\n\n"
+                f"<b>\u0424\u0443\u043d\u043a\u0446\u0438\u0439: {len(experts)}</b>\n{lines}\n\n"
+                f"<b>\u0423\u043c\u0435\u044e:</b>{caps}\n\n"
+                "\u041f\u0440\u043e\u0441\u0442\u043e \u043e\u0442\u043f\u0440\u0430\u0432\u044c \u0447\u0442\u043e \u043d\u0443\u0436\u043d\u043e!"
+            )
+        else:
+            await user_tg.send_message(chat_id, "\U0001f44b \u0411\u043e\u0442 \u043d\u0430\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0435\u0442\u0441\u044f.")
         return
 
     if not experts:
-        await user_tg.send_message(chat_id, "Бот ещё не настроен. Обратитесь к администратору.")
+        await user_tg.send_message(chat_id, "\u0411\u043e\u0442 \u0435\u0449\u0451 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d.")
         return
 
-    # ── Get file URL ──────────────────────────────────────────────────────
     file_url = None
     if file_id:
         file_url = await user_tg.get_file_url(file_id)
         if not file_url:
-            await user_tg.send_message(chat_id, "⚠️ Не удалось загрузить файл. Попробуй ещё раз.")
+            await user_tg.send_message(chat_id, "\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0444\u0430\u0439\u043b.")
             return
 
-    # ── Typing indicator ──────────────────────────────────────────────────
     await user_tg.send_chat_action(chat_id, _CHAT_ACTION.get(media_type, "typing"))
 
-    # ── Route to best expert ──────────────────────────────────────────────
-    hint   = _MEDIA_SEARCH_HINT.get(media_type, "")
-    query  = f"{text} {hint}".strip()
-    best   = await _route(experts, query)
-    logger.info(f"bot={bot.id} expert={best.expert_name} media={media_type} q={query[:50]!r}")
+    hint  = _MEDIA_SEARCH_HINT.get(media_type, "")
+    query = f"{text} {hint}".strip()
+    best  = await _route(experts, query)
+    logger.info(f"bot={bot.id} expert={best.expert_name} media={media_type}")
 
-    # ── Build params ──────────────────────────────────────────────────────
     params       = dict(best.params_json or {})
     prompt_param = params.pop("__prompt_param__", "prompt")
 
     if file_url:
-        # Inject URL under the correct semantic key
         url_key = {
             "photo":    "image_url",
             "video":    "video_url",
@@ -152,33 +139,25 @@ async def _process(user_tg, bot, msg: dict, session):
             "audio":    "audio_url",
             "document": "file_url",
         }.get(media_type, "file_url")
-
         params[url_key] = file_url
-
-        # Inject user text if it's meaningful (not the default filler) and doesn't clash
         is_filler = text == _DEFAULT_INTENT.get(media_type, "")
         if not is_filler and prompt_param != url_key:
             params[prompt_param] = text
     else:
         params[prompt_param] = text
 
-    # Inject all available API keys
     if settings.openai_api_key:
-        params["api_key"] = settings.openai_api_key
+        params["api_key"]      = settings.openai_api_key
     if settings.fal_api_key:
         params["fal_api_key"]       = settings.fal_api_key
         params["fal_api_key_value"] = settings.fal_api_key
 
-    # ── Call expert ───────────────────────────────────────────────────────
     result = await extella.run_expert(
         expert_name=best.expert_name, params=params, timeout=90)
-
-    # ── Send response ─────────────────────────────────────────────────────
     await _respond(user_tg, chat_id, result, len(experts) > 1, best.expert_name)
 
 
 async def _route(experts: list, query: str):
-    """Semantic routing via Extella search."""
     if len(experts) == 1:
         return experts[0]
     try:
@@ -194,69 +173,52 @@ async def _route(experts: list, query: str):
 
 
 async def _respond(user_tg, chat_id: int, result: dict, multi: bool, name: str):
-    """Smart response: photo/voice/video/text based on expert output."""
-    label = f"\U0001F9E0 <i>{name}</i>\n\n" if multi else ""
+    label = f"\U0001f9e0 <i>{name}</i>\n\n" if multi else ""
 
-    # Network-level error
     if result.get("status") == "error":
-        await user_tg.send_message(chat_id, f"⚠️ {result.get('message','Unknown error')}")
+        await user_tg.send_message(chat_id, f"\u26a0\ufe0f {result.get('message','Unknown')}")
         return
 
-    # Extella wraps expert result in {"result": {...}}
     inner = result.get("result", result)
-
     if not inner:
-        await user_tg.send_message(chat_id, label + "Не получил ответ. Попробуй ещё раз.")
+        await user_tg.send_message(chat_id, label + "\u041d\u0435 \u043f\u043e\u043b\u0443\u0447\u0438\u043b \u043e\u0442\u0432\u0435\u0442.")
         return
 
-    # Expert-level error
     if isinstance(inner, dict) and inner.get("status") == "error":
-        await user_tg.send_message(chat_id, f"⚠️ {inner.get('message','Ошибка')}")
+        await user_tg.send_message(chat_id, f"\u26a0\ufe0f {inner.get('message','\u041e\u0448\u0438\u0431\u043a\u0430')}")
         return
 
     if isinstance(inner, dict):
-        # ── Image result ──────────────────────────────────────────────────
         img_url = (inner.get("result_url") or inner.get("image_url")
                    or inner.get("output_url") or inner.get("output_image_url"))
         if img_url:
-            cap = label + inner.get("message", "✅ Готово!")
+            cap = label + inner.get("message", "\u2705 \u0413\u043e\u0442\u043e\u0432\u043e!")
             r = await user_tg.send_photo(chat_id, img_url, caption=cap)
             if not r.get("ok"):
-                # Telegram can't fetch URL → send as link
                 await user_tg.send_message(
-                    chat_id,
-                    f"{label}✅ Готово!\n🔗 <a href=\"{img_url}\">Открыть изображение</a>"
-                )
+                    chat_id, f"{label}\u2705 \u0413\u043e\u0442\u043e\u0432\u043e!\n\U0001f517 <a href=\"{img_url}\">\u041e\u0442\u043a\u0440\u044b\u0442\u044c</a>")
             return
 
-        # ── Audio/voice result ────────────────────────────────────────────
-        aud_url = inner.get("audio_url") or inner.get("voice_url") or inner.get("tts_url")
-        if aud_url:
-            await user_tg.send_voice(chat_id, aud_url)
-            if label:
-                await user_tg.send_message(chat_id, label.strip())
+        aud = inner.get("audio_url") or inner.get("voice_url") or inner.get("tts_url")
+        if aud:
+            await user_tg.send_voice(chat_id, aud)
+            if label: await user_tg.send_message(chat_id, label.strip())
             return
 
-        # ── Video result ──────────────────────────────────────────────────
-        vid_url = inner.get("video_url") or inner.get("output_video_url")
-        if vid_url:
-            r = await user_tg.send_video(chat_id, vid_url,
-                                          caption=label + inner.get("message",""))
+        vid = inner.get("video_url") or inner.get("output_video_url")
+        if vid:
+            r = await user_tg.send_video(chat_id, vid, caption=label + inner.get("message",""))
             if not r.get("ok"):
-                await user_tg.send_message(
-                    chat_id, f"{label}✅ Видео готово!\n🔗 <a href=\"{vid_url}\">Открыть</a>")
+                await user_tg.send_message(chat_id, f"{label}<a href=\"{vid}\">\u041e\u0442\u043a\u0440\u044b\u0442\u044c</a>")
             return
 
-    # ── Text fallback ─────────────────────────────────────────────────────
     await user_tg.send_message(chat_id, label + _text(inner))
 
 
 def _text(inner) -> str:
-    if isinstance(inner, str):
-        return inner[:4000]
+    if isinstance(inner, str): return inner[:4000]
     if isinstance(inner, dict):
-        for k in ("answer", "translated", "post", "transcription",
-                  "text", "content", "output", "message"):
+        for k in ("answer","translated","post","transcription","text","content","output","message"):
             if k in inner and isinstance(inner[k], str) and inner[k]:
                 return inner[k][:4000]
         return str(inner)[:2000]
