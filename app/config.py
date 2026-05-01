@@ -12,6 +12,7 @@ class Settings:
         self.extella_token: str = os.getenv("EXTELLA_TOKEN", "")
         self.secret_key: str = os.getenv("SECRET_KEY", "dev_secret_key_CHANGE_ME")
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+        self.fal_api_key: str = os.getenv("FAL_API_KEY", "")
         self.debug: bool = os.getenv("DEBUG", "false").lower() == "true"
         rd = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
         self.railway_url = f"https://{rd}" if rd else os.getenv("RAILWAY_URL", "")
