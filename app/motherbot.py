@@ -294,9 +294,7 @@ async def _handle_raw_key_input(cid, text, u, s):
     else:
         await motherbot.send_message(
             cid,
-            "❌ Укажи имя ключа:
-"
-            "<code>fal_api_key: aafd713e-...</code>"
+            "❌ Укажи имя ключа:\n<code>fal_api_key: aafd713e-...</code>"
         )
         return
 
