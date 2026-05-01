@@ -13,24 +13,53 @@ TOKEN_RE = re.compile(r'^\d{8,12}:[A-Za-z0-9_-]{35,}$')
 motherbot = TelegramClient(settings.motherbot_token)
 extella = ExtellaClient(settings.extella_token)
 
+# ── Improved classifier ──────────────────────────────────────────────────────
+# Signs that an expert NEEDS local machine (filesystem access, local libs, etc.)
 _LOCAL_SIGNALS = [
-    'locally', 'local file', 'local model', 'rembg', 'selenium',
-    'playwright', 'browser', 'ffmpeg', 'ollama', 'no api key needed',
-    'no api key required', 'local gpu', 'on device', 'local machine',
-    'local environment', 'filesystem', 'desktop', 'installed locally',
-    'subprocess', 'local installation', 'cpu-bound', 'on your machine',
-]
-_CLOUD_SIGNALS = [
-    'api key', 'cloud', 'openai', 'gpt', 'anthropic', 'groq',
-    'replicate', 'fal.ai', 'remove.bg', 'elevenlabs', 'azure',
-    'http', 'rest api', 'google api', 'url', 'endpoint', 'api call',
+    # Explicit local flags
+    "locally", "local file", "no api key needed", "no api key required",
+    "no api", "works locally", "runs locally", "local machine", "local gpu",
+    "local installation", "local environment", "local execution",
+    "on your machine", "on device", "on your device",
+    # Local libraries/tools
+    "rembg", "selenium", "playwright", "puppeteer", "browser",
+    "ffmpeg", "imagemagick", "ghostscript", "tesseract",
+    "ollama", "llama.cpp", "whisper local",
+    "pillow", "opencv", "cv2", "torch", "tensorflow",
+    "sklearn", "scipy", "numpy local",
+    "pyautogui", "pygetwindow", "pynput",
+    "subprocess", "shell", "terminal",
+    "sqlite", "local database",
+    # Filesystem indicators
+    "output_path", "output path", "saves to", "save to", "file path",
+    "local path", "~/downloads", "~/documents", "~/desktop",
+    "writes file", "reads file", "file system",
 ]
 
+_CLOUD_SIGNALS = [
+    # Explicit cloud/API flags
+    "api key", "api_key", "cloud", "cloud api",
+    "openai", "gpt", "chatgpt", "claude", "anthropic",
+    "groq", "together", "cohere", "mistral",
+    "replicate", "fal.ai", "fal ai",
+    "remove.bg", "elevenlabs", "deepgram",
+    "azure", "aws", "gcp", "google api",
+    "http request", "rest api", "endpoint",
+    "api call", "api token", "bearer token",
+    "webhook", "cloud function",
+]
+
+
 def _classify(name: str, description: str) -> str:
-    text = (name + ' ' + (description or '')).lower()
+    text = (name + " " + (description or "")).lower()
+    # Count weighted signals
     ls = sum(3 for s in _LOCAL_SIGNALS if s in text)
     cs = sum(2 for s in _CLOUD_SIGNALS if s in text)
-    return 'local' if ls > cs else 'cloud'
+    # Extra weight: if description says "no api" = definitely local
+    if "no api" in text or "locally" in text or "output_path" in text:
+        ls += 5
+    logger.debug(f"classify {name}: local={ls} cloud={cs}")
+    return "local" if ls > cs else "cloud"
 
 def _clean_desc(desc: str) -> str:
     for sep in ['. Parameters:', '\nParameters:', ' Parameters:']:
