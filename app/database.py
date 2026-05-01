@@ -1,30 +1,33 @@
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 from datetime import datetime
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Boolean, Text, DateTime, JSON, BigInteger, Integer
 from .config import settings
 
-engine = create_async_engine(settings.database_url, echo=settings.debug, pool_pre_ping=True, pool_size=10, max_overflow=20)
+engine = create_async_engine(settings.database_url, echo=settings.debug,
+    pool_pre_ping=True, pool_size=10, max_overflow=20)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
     pass
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = 'users'
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(100), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    state: Mapped[str] = mapped_column(String(50), default="start")
+    state: Mapped[str] = mapped_column(String(50), default='start')
     pending_bot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+        onupdate=datetime.utcnow)
 
 class Bot(Base):
-    __tablename__ = "bots"
+    __tablename__ = 'bots'
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
     token_encrypted: Mapped[str] = mapped_column(Text)
@@ -35,16 +38,20 @@ class Bot(Base):
     webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_extella_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_target_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+        onupdate=datetime.utcnow)
 
 class BotExpert(Base):
-    __tablename__ = "bot_experts"
+    __tablename__ = 'bot_experts'
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     expert_name: Mapped[str] = mapped_column(String(100))
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    trigger_type: Mapped[str] = mapped_column(String(20), default="any")
+    exec_type: Mapped[str] = mapped_column(String(10), default='cloud')
+    trigger_type: Mapped[str] = mapped_column(String(20), default='any')
     trigger_value: Mapped[str | None] = mapped_column(String(100), nullable=True)
     params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -64,3 +71,12 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for stmt in [
+            'ALTER TABLE bots ADD COLUMN IF NOT EXISTS user_extella_token_enc TEXT',
+            'ALTER TABLE bots ADD COLUMN IF NOT EXISTS user_target_id VARCHAR(100)',
+            'ALTER TABLE bot_experts ADD COLUMN IF NOT EXISTS exec_type VARCHAR(10) DEFAULT \'cloud\'',
+        ]:
+            try:
+                await conn.execute(sql_text(stmt))
+            except Exception:
+                pass
