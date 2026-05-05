@@ -332,13 +332,21 @@ async def _route(exps: list, query: str):
         ms = await extella.search_experts(query, limit=15)
         by = {e.expert_name: e for e in exps}
         for m in ms:
-            if m["name"] in by:
-                logger.info(f"Matched {m['name']} score={m.get('score', '?')} for query={query[:40]!r}")
-                return by[m["name"]]
+            name = m["name"]
+            # Exact match
+            if name in by:
+                logger.info("Matched %s exact score=%s q=%s", name, m.get("score","?"), query[:35])
+                return by[name]
+            # Fuzzy: split library name into words, find bot expert containing same word
+            parts = [part for part in name.split("_") if len(part) >= 4]
+            for part in parts:
+                for bot_name, bot_exp in by.items():
+                    if part in bot_name:
+                        logger.info("Matched %s fuzzy via %s/%s q=%s", bot_name, name, part, query[:35])
+                        return bot_exp
     except Exception as e:
-        logger.warning(f"Route fail: {e}")
+        logger.warning("Route fail: %s", e)
     return exps[0]
-
 
 async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
     label = f"🧠 <i>{name}</i>\n\n" if multi else ""
