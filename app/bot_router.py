@@ -300,9 +300,24 @@ def _build_params(bot, best, text: str, mt: str, furl: str | None,
     else:
         params[pp] = text
 
-    # Inject ALL API keys (platform + user-provided)
+    # Smart API key injection:
+    # Only inject api_key/openai_api_key for AI/LLM experts.
+    # Prevents TypeError: unexpected keyword argument 'api_key' in non-AI experts.
     all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
-    params.update(all_keys)
+    exp_desc = (best.display_name or best.expert_name or "").lower()
+    needs_ai_keys = any(w in exp_desc for w in [
+        "openai", "gpt", "llm", "ai", "translate", "summariz",
+        "transcrib", "whisper", "anthropic", "claude", "replicate",
+        "fal", "image generat", "stable diffusion", "dall",
+        "answer", "question", "chat", "post", "caption",
+    ])
+    safe_user_keys = {k: v for k, v in all_keys.items()
+                      if k not in ("api_key", "openai_api_key")}
+    params.update(safe_user_keys)
+    if needs_ai_keys:
+        for k in ("api_key", "openai_api_key"):
+            if k in all_keys:
+                params[k] = all_keys[k]
 
     # Language
     inst = _LANG.get(lang, f"Respond in {lang} language.")
