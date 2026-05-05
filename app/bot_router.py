@@ -215,21 +215,51 @@ async def _process(utg, bot, msg: dict, session):
     params = _build_params(bot, best, text, mt, furl, lang, cid)
 
     # ── Execute ───────────────────────────────────────────────────────────────
-    if bot.user_target_id and bot.user_extella_token_enc:
-        # User has a connected device
-        user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
-        local_client = ExtellaClient(user_tok)
-        result = await local_client.run_expert(
+    # Determine if we have a valid device UUID (not "auto", not empty, proper UUID format)
+    tid = (bot.user_target_id or "").strip()
+    has_valid_device = (
+        len(tid) == 36 and tid.count("-") == 4 and tid != "auto"
+        and bot.user_extella_token_enc
+    )
+
+    # Check if this expert requires local machine (filesystem/Pillow/ffmpeg etc.)
+    is_local_expert = best.expert_name.lower() in _KNOWN_LOCAL_EXPERTS
+    if not is_local_expert:
+        desc = (best.display_name or "").lower()
+        name_l = best.expert_name.lower()
+        is_local_expert = any(w in name_l + " " + desc for w in [
+            "pillow", "opencv", "ffmpeg", "rembg", "ollama",
+            "output_path", "saves to", "local file",
+            "no api key needed", "subprocess", "filesystem",
+        ])
+
+    if is_local_expert and not has_valid_device:
+        # Local expert but no valid device UUID — ask user to provide it
+        await utg.send_message(
+            cid,
+            "\u26a0\ufe0f <b>" + (best.display_name or best.expert_name) + "</b> "
+            "requires your computer to run.\n\n"
+            "To connect your device:\n"
+            "1. Open <b>Extella Desktop</b>\n"
+            "2. Find your <b>Device UUID</b> in Settings\n"
+            "3. Use /connect in @extnickbot_bot and follow instructions\n\n"
+            "<i>Or ask Extella AI agent: "
+            "<code>What is my device UUID?</code></i>"
+        )
+        return
+
+    if has_valid_device:
+        # PLATFORM TOKEN + user device UUID → runs on user's machine
+        # Platform token can access platform experts on any registered device
+        result = await extella.run_expert(
             best.expert_name, params, wait=True, timeout=120,
-            target=bot.user_target_id,
+            target=tid,  # explicit valid UUID
         )
         if result.get("status") == "async":
-            # Device async — fall back to serverless
-            logger.info(f"Device async for {best.expert_name}, falling back to serverless")
-            result = await extella.run_expert(
-                best.expert_name, params, wait=True, timeout=90)
+            logger.info(f"Device async for {best.expert_name}, noting for user")
+            # Result will be saved to ~/Downloads on user's machine
     else:
-        # Serverless (EXTELLA_SERVERLESS_TOKEN, no target)
+        # Serverless — no target (platform routes to remote workers)
         result = await extella.run_expert(
             best.expert_name, params, wait=True, timeout=90)
 
