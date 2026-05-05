@@ -268,9 +268,11 @@ async def _send_desktop_instructions(cid):
         "   <a href=\"https://extella.ai/download\">extella.ai/download</a>\n"
         "   (Mac / Windows / Linux)\n\n"
         "<b>2.</b> Install and launch Extella Desktop\n\n"
-        "<b>3.</b> In Extella: <b>Settings \u2192 API Tokens \u2192 Generate</b>\n\n"
-        "<b>4.</b> Copy the token and send it here:\n\n"
-        "\U0001f4e4 <b>Paste your Extella API token:</b>",
+        "<b>3.</b> Open Extella \u2192 <b>Settings \u2192 API Tokens \u2192 Generate Token</b>\n\n"
+        "<b>4.</b> Copy the <b>API Token</b> (UUID format like\n"
+        "   <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>)\n\n"
+        "\u26a0\ufe0f Do NOT send your User ID \u2014 that is a different thing.\n\n"
+        "\U0001f4e4 <b>Paste your Extella API Token here:</b>",
         reply_markup={"inline_keyboard": [[
             {"text": "\u2753 What is Extella?", "callback_data": "explain_extella"},
             {"text": "\u274c Cancel", "callback_data": "cancel_key"},
