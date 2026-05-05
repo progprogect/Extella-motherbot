@@ -3,16 +3,13 @@ import logging
 logger = logging.getLogger(__name__)
 EXTELLA_BASE = "https://api.extella.ai"
 
-# Dronor v0.5.3 requires X-Profile-Id and X-Agent-Id in ALL requests
-_PROFILE_ID = "default"
-_AGENT_ID   = "agent_extella_default"
 
-
-def _headers(token: str) -> dict:
+def _h(token: str) -> dict:
+    """All Extella API requests require these 3 headers (Dronor v0.5.3+)."""
     return {
         "X-Auth-Token":  token,
-        "X-Profile-Id":  _PROFILE_ID,
-        "X-Agent-Id":    _AGENT_ID,
+        "X-Profile-Id":  "default",
+        "X-Agent-Id":    "agent_extella_default",
         "Content-Type":  "application/json",
     }
 
@@ -21,14 +18,12 @@ class ExtellaClient:
     def __init__(self, token: str):
         self.token = token
 
-    def _h(self) -> dict:
-        return _headers(self.token)
-
     async def search_experts(self, query: str, limit: int = 10) -> list[dict]:
         try:
             async with httpx.AsyncClient(timeout=15) as c:
                 r = await c.post(f"{EXTELLA_BASE}/api/blocks/search",
-                    headers=self._h(), json={"query": query, "limit": limit})
+                    headers=_h(self.token),
+                    json={"query": query, "limit": limit})
                 r.raise_for_status()
                 return r.json().get("matches", [])
         except Exception as e:
@@ -43,16 +38,18 @@ class ExtellaClient:
             "params": params or {},
             "wait": wait,
         }
-        if target:
-            payload["target"] = target
+        # Only include target if it's a non-empty string
+        if target and isinstance(target, str) and target.strip():
+            payload["target"] = target.strip()
+
         try:
             async with httpx.AsyncClient(timeout=timeout + 10) as c:
                 r = await c.post(f"{EXTELLA_BASE}/api/expert/run",
-                    headers=self._h(), json=payload)
+                    headers=_h(self.token), json=payload)
                 r.raise_for_status()
                 resp = r.json()
             if resp.get("task_id") and not resp.get("result"):
-                logger.warning(f"Expert {expert_name} returned task_id (async/device)")
+                logger.warning(f"Expert {expert_name} returned task_id (async)")
                 return {"status": "async", "task_id": resp.get("task_id"),
                         "expert_name": expert_name}
             return resp
@@ -60,33 +57,44 @@ class ExtellaClient:
             return {"status": "error",
                     "message": f"Expert '{expert_name}' timed out ({timeout}s)"}
         except httpx.HTTPStatusError as e:
+            body = ""
+            try: body = e.response.text[:200]
+            except Exception: pass
             return {"status": "error",
-                    "message": f"Extella API error: HTTP {e.response.status_code}"}
+                    "message": f"Extella API HTTP {e.response.status_code}: {body}"}
         except Exception as e:
             logger.error(f"run_expert({expert_name}): {e}")
             return {"status": "error", "message": str(e)}
 
     async def validate_token(self, token: str) -> bool:
-        """Validate an Extella API token (using that token's own headers)."""
+        """
+        Validate an Extella API token.
+        API expects: POST /api/token/validate with body {"token": "<token>"}
+        """
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(
                     f"{EXTELLA_BASE}/api/token/validate",
-                    headers=_headers(token),
-                    json={},
+                    headers=_h(token),
+                    json={"token": token},   # ← token must be in body
                 )
                 data = r.json()
-                return data.get("valid", False) or data.get("status") == "success"
-        except Exception:
+                return (data.get("valid") is True
+                        or data.get("status") == "success")
+        except Exception as e:
+            logger.error(f"validate_token: {e}")
             return False
 
     async def list_targets(self, token: str) -> list[dict]:
-        """List registered devices/targets for the given token."""
+        """
+        List devices registered for the given token's user.
+        Returns list of {id, target, description} dicts.
+        """
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(
                     f"{EXTELLA_BASE}/api/targets/list",
-                    headers=_headers(token),
+                    headers=_h(token),
                     json={},
                 )
                 data = r.json()
