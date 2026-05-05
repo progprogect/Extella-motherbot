@@ -124,6 +124,7 @@ async def _handle_message(msg: dict):
         elif u.state == "waiting_token": await _handle_token(cid, text, u, s)
         elif u.state == "waiting_feature_description": await _handle_desc(cid, text, u, s)
         elif u.state == "waiting_extella_token": await _handle_extella_token(cid, text, u, s)
+        elif u.state == "waiting_device_uuid": await _handle_device_uuid(cid, text, u, s)
         elif u.state == "waiting_server_url": await _handle_server_url(cid, text, u, s)
         elif u.state == "waiting_server_token": await _handle_server_token(cid, text, u, s)
         elif u.state == "waiting_api_key_input": await _handle_api_key_input(cid, text, u, s)
@@ -289,11 +290,12 @@ async def _handle_extella_token(cid, text, u, s):
         await motherbot.send_message(
             cid,
             "Invalid token. Please check and try again.\n\n"
-            "Copy the full token from Extella Desktop"
-            " -> Settings -> API Tokens."
+            "Open Extella Desktop, ask the AI agent:\n"
+            "<code>Generate an API token for me</code>\n\n"
+            "Then paste the UUID token here."
         )
         return
-    # Try to get the actual device UUID from this token
+    # Try to find device UUID from targets list
     targets = await tmp.list_targets(text)
     target_id = None
     target_name = "Your Device"
@@ -305,19 +307,64 @@ async def _handle_extella_token(cid, text, u, s):
     bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
     if bot:
         bot.user_extella_token_enc = encrypt_token(text, settings.secret_key)
-        # Store real UUID if available, otherwise 'auto' (Extella auto-routes)
-        bot.user_target_id = target_id if target_id else "auto"
+        if target_id:
+            # Found device UUID from API
+            bot.user_target_id = target_id
+        elif not bot.user_target_id or bot.user_target_id == "auto":
+            # No device found and no existing UUID — ask for it
+            u.state = "waiting_device_uuid"
+            u.pending_bot_id = bid
+            await s.flush()
+            await motherbot.send_message(
+                cid,
+                "Token saved!\n\n"
+                "To link your device, send me your <b>Device UUID</b>.\n\n"
+                "Find it in Extella Desktop:\n"
+                "Ask the AI agent: <code>What is my device UUID?</code>\n\n"
+                "Or check Settings section in Extella Desktop.\n\n"
+                "Format: <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>"
+            )
+            return
+        # else: keep existing valid UUID
     u.state = "active"; u.pending_bot_id = None; await s.flush()
     exps = (await s.execute(select(BotExpert).where(
         BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
-    device_info = f"Device: {target_name}" if target_id else "Device: auto-detected"
+    device_msg = f"Device: {target_name}" if target_id else "Device linked."
     await motherbot.send_message(
         cid,
-        "Connected! " + device_info + "\n\n"
-        "Local experts will now run on your machine.\n\n"
-        "Keep Extella Desktop open while using local functions."
+        f"Connected! {device_msg}\n\n"
+        "Local experts will now run on your machine."
     )
     await _do_activate(cid, u, s, bot, list(exps))
+
+async def _handle_device_uuid(cid, text, u, s):
+    """User provides their device UUID manually."""
+    if text.lower() in ("cancel", "/cancel"):
+        u.state = "active"; await s.flush()
+        await motherbot.send_message(cid, "Cancelled."); return
+    uuid = text.strip()
+    if len(uuid) != 36 or uuid.count("-") != 4:
+        await motherbot.send_message(
+            cid,
+            "That doesn't look like a valid UUID.\n"
+            "Format: <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>\n\n"
+            "Try again or /cancel"
+        )
+        return
+    bid = u.pending_bot_id
+    bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
+    if bot:
+        bot.user_target_id = uuid
+    u.state = "active"; u.pending_bot_id = None; await s.flush()
+    exps = (await s.execute(select(BotExpert).where(
+        BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
+    await motherbot.send_message(
+        cid,
+        f"Device UUID saved: <code>{uuid[:8]}...</code>\n"
+        "Local experts will now run on your device!"
+    )
+    await _do_activate(cid, u, s, bot, list(exps))
+
 
 async def _handle_server_url(cid, text, u, s):
     url = text.strip().rstrip("/")

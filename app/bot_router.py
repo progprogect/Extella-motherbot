@@ -367,6 +367,10 @@ async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
         return
 
     if isinstance(inner, dict):
+        # Expert already sent result to Telegram directly (local expert pattern)
+        if inner.get("sent_to_telegram"):
+            # Expert handled delivery itself — don't double-send
+            return
         # Image
         iu = (inner.get("result_url") or inner.get("image_url")
               or inner.get("output_url") or inner.get("output_image_url"))
