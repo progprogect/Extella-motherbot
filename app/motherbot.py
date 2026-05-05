@@ -254,8 +254,7 @@ async def _show_execution_mode(cid, u, s, bot, exps):
               "callback_data": f"mode_desktop|{bot.id}"}],
             [{"text": "\U0001f310 Option B \u2014 My Own Server",
               "callback_data": f"mode_server|{bot.id}"}],
-            [{"text": "\u2601\ufe0f Option C \u2014 Cloud only (skip local experts)",
-              "callback_data": f"mode_cloud_only|{bot.id}"}],
+
         ]})
 
 
@@ -509,23 +508,15 @@ async def _handle_callback(cb: dict):
             await motherbot.send_message(cid,
                 "\U0001f310 <b>Self-Hosted Server Setup</b>\n\n"
                 "You need a VPS/cloud server with Docker installed.\n\n"
-                "<b>Step 1.</b> Open Extella Desktop \u2192 AI Agent and send this message:\n\n"
+                "<b>Step 1.</b> Download and install Extella Desktop on any machine:\n"
+                "<a href=\"https://extella.ai/download\">extella.ai/download</a>\n"
+                "(Mac / Windows / Linux)\n\n"
+                "<b>Step 2.</b> Open Extella Desktop \u2192 AI Agent and send this message:\n\n"
                 "<pre>" + _DEPLOY_PROMPT + "</pre>\n\n"
-                "<b>Step 2.</b> Wait for deployment to complete.\n\n"
-                "<b>Step 3.</b> Send me the server URL:\n"
+                "<b>Step 3.</b> Wait for deployment to complete (Extella will handle it).\n\n"
+                "<b>Step 4.</b> Send me the server URL:\n"
                 "Example: <code>http://123.45.67.89:7755</code>")
-        elif action == "mode_cloud_only" and len(parts) == 2:
-            bid = int(parts[1])
-            bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
-            if not bot: await motherbot.answer_callback_query(cbid, "Not found"); return
-            cloud_exps = (await s.execute(select(BotExpert).where(
-                BotExpert.bot_id == bid, BotExpert.exec_type == "cloud",
-                BotExpert.is_active == True))).scalars().all()
-            if not cloud_exps:
-                await motherbot.answer_callback_query(
-                    cbid, "No cloud experts selected!", show_alert=True); return
-            await motherbot.answer_callback_query(cbid, "\u23f3 Activating...")
-            await _do_activate(cid, u, s, bot, list(cloud_exps))
+
         elif action == "manage" and len(parts) == 2:
             bid = int(parts[1])
             bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
