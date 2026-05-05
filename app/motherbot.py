@@ -281,29 +281,39 @@ async def _handle_extella_token(cid, text, u, s):
     if text.lower() in ("cancel", "/cancel"):
         u.state = "active"; await s.flush()
         await motherbot.send_message(cid, "Cancelled."); return
-    await motherbot.send_message(cid, "⏳ Validating token...")
+    await motherbot.send_message(cid, "Validating token...")
     tmp = ExtellaClient(text)
     if not await tmp.validate_token(text):
         await motherbot.send_message(
             cid,
-            "❌ Invalid token. Please check and try again.\n\n"
-            "Copy the full token from Extella Desktop "
-            "→ Settings → API Tokens."
+            "Invalid token. Please check and try again.\n\n"
+            "Copy the full token from Extella Desktop"
+            " -> Settings -> API Tokens."
         )
         return
+    # Try to get the actual device UUID from this token
+    targets = await tmp.list_targets(text)
+    target_id = None
+    target_name = "Your Device"
+    if targets:
+        first = targets[0]
+        target_id = first.get("target") or first.get("id")
+        target_name = first.get("description", "Your Device")[:50]
     bid = u.pending_bot_id
     bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
     if bot:
         bot.user_extella_token_enc = encrypt_token(text, settings.secret_key)
-        bot.user_target_id = "auto"
+        # Store real UUID if available, otherwise 'auto' (Extella auto-routes)
+        bot.user_target_id = target_id if target_id else "auto"
     u.state = "active"; u.pending_bot_id = None; await s.flush()
     exps = (await s.execute(select(BotExpert).where(
         BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
+    device_info = f"Device: {target_name}" if target_id else "Device: auto-detected"
     await motherbot.send_message(
         cid,
-        "✅ <b>Extella connected!</b>\n\n"
-        "💻 Local experts will now run on your machine.\n\n"
-        "<i>Keep Extella Desktop open while using local functions.</i>"
+        "Connected! " + device_info + "\n\n"
+        "Local experts will now run on your machine.\n\n"
+        "Keep Extella Desktop open while using local functions."
     )
     await _do_activate(cid, u, s, bot, list(exps))
 
