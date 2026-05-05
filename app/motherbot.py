@@ -259,25 +259,25 @@ async def _show_execution_mode(cid, u, s, bot, exps):
 
 
 async def _send_desktop_instructions(cid):
-    await motherbot.send_message(cid,
-        "\U0001f5a5\ufe0f <b>Connect Extella Desktop</b>\n\n"
+    await motherbot.send_message(
+        cid,
+        "\U0001f5a5\ufe0f <b>Connect Your Device to Extella</b>\n\n"
         + _EXTELLA_ABOUT + "\n\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        "<b>Setup (\u22482 minutes):</b>\n\n"
-        "<b>1.</b> Download Extella Desktop:\n"
-        "   <a href=\"https://extella.ai/download\">extella.ai/download</a>\n"
-        "   (Mac / Windows / Linux)\n\n"
-        "<b>2.</b> Install and launch Extella Desktop\n\n"
-        "<b>3.</b> Open Extella \u2192 <b>Settings \u2192 API Tokens \u2192 Generate Token</b>\n\n"
-        "<b>4.</b> Copy the <b>API Token</b> (UUID format like\n"
-        "   <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>)\n\n"
-        "\u26a0\ufe0f Do NOT send your User ID \u2014 that is a different thing.\n\n"
-        "\U0001f4e4 <b>Paste your Extella API Token here:</b>",
+        "<b>How to get your API Token:</b>\n\n"
+        "<b>1.</b> Download and open Extella Desktop:\n"
+        "   <a href=\"https://extella.ai/download\">extella.ai/download</a>\n\n"
+        "<b>2.</b> In the Extella chat, send this message to the AI agent:\n\n"
+        "<code>Generate an API token for me</code>\n\n"
+        "<b>3.</b> The agent will reply with a token like:\n"
+        "   <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>\n\n"
+        "<b>4.</b> Copy that token and paste it here:\n\n"
+        "\U0001f4e4 <b>Paste your Extella API Token:</b>",
         reply_markup={"inline_keyboard": [[
             {"text": "\u2753 What is Extella?", "callback_data": "explain_extella"},
             {"text": "\u274c Cancel", "callback_data": "cancel_key"},
-        ]]})
-
+        ]]}
+    )
 
 async def _handle_extella_token(cid, text, u, s):
     if text.lower() in ("cancel", "/cancel"):
