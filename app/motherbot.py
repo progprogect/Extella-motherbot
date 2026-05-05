@@ -281,37 +281,31 @@ async def _handle_extella_token(cid, text, u, s):
     if text.lower() in ("cancel", "/cancel"):
         u.state = "active"; await s.flush()
         await motherbot.send_message(cid, "Cancelled."); return
-    await motherbot.send_message(cid, "\u23f3 Validating token and detecting devices...")
+    await motherbot.send_message(cid, "⏳ Validating token...")
     tmp = ExtellaClient(text)
     if not await tmp.validate_token(text):
-        await motherbot.send_message(cid,
-            "\u274c Invalid token. Please check and try again, "
-            "or generate a new one in Extella Desktop \u2192 Settings \u2192 API Tokens.")
+        await motherbot.send_message(
+            cid,
+            "❌ Invalid token. Please check and try again.\n\n"
+            "Copy the full token from Extella Desktop "
+            "→ Settings → API Tokens."
+        )
         return
-    targets = await tmp.list_targets(text)
-    if not targets:
-        await motherbot.send_message(cid,
-            "\u26a0\ufe0f Token is valid but no devices found.\n\n"
-            "Make sure Extella Desktop is <b>open and running</b> on your machine "
-            "(it registers automatically when running).\n\nThen try sending the token again.")
-        return
-    first = targets[0]
-    target_id = first.get("target") or first.get("id", "")
-    target_name = first.get("description", "My Device")[:50]
     bid = u.pending_bot_id
     bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
     if bot:
         bot.user_extella_token_enc = encrypt_token(text, settings.secret_key)
-        bot.user_target_id = target_id
+        bot.user_target_id = "auto"
     u.state = "active"; u.pending_bot_id = None; await s.flush()
     exps = (await s.execute(select(BotExpert).where(
         BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
-    await motherbot.send_message(cid,
-        f"\u2705 <b>Device connected: {target_name}</b>\n\n"
-        "\U0001f4bb Local experts will now run on your machine.\n"
-        "Keep Extella Desktop running for the bot to work.")
+    await motherbot.send_message(
+        cid,
+        "✅ <b>Extella connected!</b>\n\n"
+        "💻 Local experts will now run on your machine.\n\n"
+        "<i>Keep Extella Desktop open while using local functions.</i>"
+    )
     await _do_activate(cid, u, s, bot, list(exps))
-
 
 async def _handle_server_url(cid, text, u, s):
     url = text.strip().rstrip("/")
