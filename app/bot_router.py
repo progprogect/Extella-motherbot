@@ -123,6 +123,18 @@ def _extract_text(inner) -> str:
     return _safe(parts[0][:4000]) if parts else "✅ Готово."
 
 
+
+# Local-only experts that require filesystem/Pillow/ffmpeg on a real device
+_KNOWN_LOCAL_EXPERTS = {
+    "image_enhance", "improve_photo_quality",
+    "remove_background_local", "remove_bg_local",
+    "video_enhance", "video_upscale", "text_to_speech",
+    "transcribe_audio_file", "audio_to_text_free",
+    "pdf_edit", "edit_pdf", "merge_pdf", "split_pdf",
+    "organize_files", "file_organizer", "scan_folder",
+    "convert_file", "file_converter", "save_presentation_pptx",
+}
+
 async def handle_user_bot_update(token_hash: str, data: dict):
     try:
         async with get_session() as session:
