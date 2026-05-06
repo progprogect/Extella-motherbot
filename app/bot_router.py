@@ -360,63 +360,75 @@ async def _route(exps: list, query: str):
     return exps[0]
 
 async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
-    label = f"🧠 <i>{name}</i>\n\n" if multi else ""
+    """Universal result → Telegram delivery."""
+    label = f"\U0001f9e0 <i>{name}</i>\n\n" if multi else ""
 
-    # Async — expert dispatched to device
     if result.get("status") == "async":
-        await utg.send_message(
-            cid,
-            f"{label}⏳ <b>Задача запущена на вашем устройстве</b>\n\n"
-            "Эксперт работает локально. Результат появится в ~/Downloads.\n"
-            "<i>Убедитесь, что Extella Desktop запущен.</i>",
-        )
+        await utg.send_message(cid,
+            f"{label}\u23f3 <b>Running on your device</b>\n\n"
+            "Expert is processing locally. Result will appear in ~/Downloads.\n"
+            "<i>Keep Extella Desktop running.</i>")
         return
 
     if result.get("status") == "error":
-        await utg.send_message(cid, f"⚠️ {_safe(result.get('message', 'Ошибка'))}")
+        await utg.send_message(cid, f"\u26a0\ufe0f {_safe(result.get('message', 'Error'))}")
         return
 
+    # Extella wraps expert return value in result field (may be string)
     inner = result.get("result", result)
+
+    # Parse string result — Extella serializes the expert's return dict as string
+    if isinstance(inner, str):
+        import json
+        try:
+            inner = json.loads(inner)
+        except Exception:
+            import ast
+            try:
+                inner = ast.literal_eval(inner)
+            except Exception:
+                pass  # Keep as string
+
     if not inner:
-        await utg.send_message(cid, label + "Нет ответа. Попробуйте ещё раз.")
+        await utg.send_message(cid, label + "No response. Please try again.")
         return
 
     if isinstance(inner, dict) and inner.get("status") == "error":
-        await utg.send_message(cid, f"⚠️ {_safe(inner.get('message', 'Ошибка'))}")
+        await utg.send_message(cid, f"\u26a0\ufe0f {_safe(inner.get('message', 'Error'))}")
         return
 
     if isinstance(inner, dict):
-        # Expert already sent result to Telegram directly (local expert pattern)
+        # Expert self-delivered — do nothing
         if inner.get("sent_to_telegram"):
-            # Expert handled delivery itself — don't double-send
             return
-        # Image
+
+        # Image URL
         iu = (inner.get("result_url") or inner.get("image_url")
               or inner.get("output_url") or inner.get("output_image_url"))
         if iu:
-            await _send_media(utg, cid, iu,
-                              label + inner.get("message", "✅"), "photo")
+            await _send_media(utg, cid, iu, label + inner.get("message", "\u2705"), "photo")
             return
-        # Audio
-        au = (inner.get("audio_url") or inner.get("voice_url")
-              or inner.get("tts_url"))
+
+        # Audio URL
+        au = inner.get("audio_url") or inner.get("voice_url") or inner.get("tts_url")
         if au:
             await _send_media(utg, cid, au, label, "voice")
             return
-        # Video
+
+        # Video URL
         vu = inner.get("video_url") or inner.get("output_video_url")
         if vu:
-            await _send_media(utg, cid, vu, label + "✅", "video")
-            return
-        # Local file path
-        if inner.get("output_path") and inner.get("status") == "success":
-            await utg.send_message(
-                cid,
-                f"{label}✅ Файл сохранён на вашем устройстве:\n"
-                f"📁 <code>{inner['output_path']}</code>",
-            )
+            await _send_media(utg, cid, vu, label + "\u2705", "video")
             return
 
+        # File saved on device
+        if inner.get("output_path") and inner.get("status") == "success":
+            await utg.send_message(cid,
+                f"{label}\u2705 File saved on your device:\n"
+                f"\U0001f4c1 <code>{inner['output_path']}</code>")
+            return
+
+    # Fallback: extract meaningful text
     await utg.send_message(cid, label + _extract_text(inner))
 
 
