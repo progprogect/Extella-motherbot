@@ -203,7 +203,7 @@ async def _handle_desc(cid, text, u, s):
     if not bot: await motherbot.send_message(cid, "/start"); return
     await motherbot.send_message(cid,
         f"\U0001f50d Searching Extella library for <i>{text[:60]}</i>...")
-    matches = await extella.search_experts(text, limit=7)
+    matches = await extella.search_experts(text, limit=15)
     if not matches:
         await motherbot.send_message(cid,
             "\U0001f615 No experts found. Try rephrasing:\n"
