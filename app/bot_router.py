@@ -1,151 +1,130 @@
 """
-Motherbot v8 — Universal Dynamic Expert Execution
+Motherbot v11 — Clean Architecture
 
-Execution modes (automatic, no hardcoded logic per expert):
-  1. Serverless (EXTELLA_SERVERLESS_TOKEN, no target):
-     wait=true → synchronous result → Railway → Telegram ✅
-  2. User device (user_extella_token + user_target_id):
-     wait=true, timeout=120 → if result → Telegram ✅
-     If task_id (async) → inform user, check callback
-  3. Async callback (expert POSTs to /expert_result endpoint):
-     Expert receives __tg_bot_token__ + __tg_chat_id__ + __railway_callback_url__
-     → can send result directly when done
+ROUTING DECISION (single path, no redundancy):
+  1 expert  → skip routing, call directly
+  N experts + OpenAI key → orchestrator (parallel kwargs fetch)
+  N experts, no key     → semantic fallback
 
-Key design:
-  - NO hardcoded cloud_runners — everything goes through Extella dynamically
-  - ALL user API keys injected into every expert call
-  - Expert picks whatever params it needs
-  - Results always delivered to Telegram (text/photo/voice/video/document)
+API calls per message:
+  Orchestrator path: N×get_kwargs (parallel) + 1×orchestrator + 1×expert = 3 round-trips
+  Semantic path:     1×search + 1×get_kwargs + 1×expert = 3 round-trips
+  No path runs both.
 """
+import asyncio
+import json
 import logging
 import re
+import ast as _ast
 from sqlalchemy import select
+
 from .database import Bot, BotExpert, get_session
 from .telegram_client import TelegramClient
 from .extella_client import ExtellaClient
 from .crypto import decrypt_token
 from .config import settings
 from .key_manager import build_expert_params
+from .mb_bot_manage import (
+    handle_delete_confirm as _mgr_del,
+    handle_edit_description as _mgr_edit,
+)
 
 logger = logging.getLogger(__name__)
 extella = ExtellaClient(settings.extella_token)
 
-# ── Security ──────────────────────────────────────────────────────────────────
 _KEY_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}"
     r"|eyJ[A-Za-z0-9_.-]{30,}|aafd[A-Za-z0-9_-]{25,}"
     r"|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})"
 )
-
+_LOCAL_ERR = [
+    "no module named", "modulenotfounderror", "cannot identify image file",
+    "file not found", "no such file or directory", "permission denied",
+    "pillow", "opencv", "ffmpeg", "rembg", "ollama",
+    "browser", "playwright", "selenium", "connection refused",
+]
 _LANG = {
-    "ru": "Отвечай только на русском языке.",
-    "en": "Respond only in English.",
-    "de": "Antworte nur auf Deutsch.",
-    "fr": "Reponds uniquement en francais.",
-    "es": "Responde solo en espanol.",
-    "uk": "Відповідай тільки українською.",
-    "it": "Rispondi solo in italiano.",
-    "pt": "Responda apenas em portugues.",
-    "zh": "只用中文回答。",
-    "ja": "日本語のみで回答してください。",
-    "ko": "한국어로만 답변하세요.",
-    "tr": "Sadece Turkce yanit ver.",
-    "pl": "Odpowiadaj tylko po polsku.",
-    "ar": "أجب باللغة العربية فقط.",
+    "ru": "Respond only in Russian.", "en": "Respond only in English.",
+    "de": "Respond only in German.", "fr": "Respond only in French.",
+    "es": "Respond only in Spanish.", "uk": "Respond only in Ukrainian.",
+    "it": "Respond only in Italian.", "pt": "Respond only in Portuguese.",
+    "zh": "Respond only in Chinese.", "ja": "Respond only in Japanese.",
+    "ko": "Respond only in Korean.", "tr": "Respond only in Turkish.",
+    "pl": "Respond only in Polish.", "ar": "Respond only in Arabic.",
 }
 _DEFAULT_INTENT = {
-    "photo":    "обработай это изображение",
-    "video":    "опиши это видео",
-    "voice":    "транскрибируй голосовое сообщение",
-    "audio":    "транскрибируй аудиофайл",
-    "document": "обработай документ",
+    "photo": "process this image", "video": "process this video",
+    "voice": "transcribe this voice message", "audio": "transcribe this audio",
+    "document": "process this document",
 }
 _CHAT_ACTION = {
-    "text":     "typing",
-    "photo":    "upload_photo",
-    "video":    "upload_video",
-    "voice":    "record_voice",
-    "audio":    "upload_voice",
-    "document": "upload_document",
+    "text": "typing", "photo": "upload_photo", "video": "upload_video",
+    "voice": "record_voice", "audio": "upload_voice", "document": "upload_document",
 }
 _MEDIA_HINT = {
-    "photo":    "image photo visual processing enhance quality",
-    "video":    "video processing analyze describe",
-    "voice":    "voice audio transcription speech to text whisper",
-    "audio":    "audio transcription processing",
+    "photo": "image photo visual processing enhance quality",
+    "video": "video processing analyze describe",
+    "voice": "voice audio transcription speech to text",
+    "audio": "audio transcription processing",
     "document": "document file text extraction analysis",
 }
 _HIDDEN = {
     "execution_log", "task_id", "Kwargs", "kwargs", "expert_name",
-    "api_key", "openai_api_key", "fal_api_key", "fal_api_key_value",
-    "anthropic_api_key", "replicate_api_token", "groq_api_key",
-    "language", "system_prompt", "__prompt_param__",
-    "__tg_bot_token__", "__tg_chat_id__", "__railway_callback_url__",
-    "status",
+    "api_key", "openai_api_key", "fal_api_key", "anthropic_api_key",
+    "replicate_api_token", "groq_api_key", "language", "system_prompt",
+    "__prompt_param__", "__tg_bot_token__", "__tg_chat_id__",
+    "__railway_callback_url__", "status",
 }
 
 
-def _safe(text: str) -> str:
-    return _KEY_RE.sub("[***]", str(text))
+def _safe(t: str) -> str:
+    return _KEY_RE.sub("[***]", str(t))
 
 
 def _detect_lang(msg: dict) -> str:
     lang = (msg.get("from") or {}).get("language_code", "")
-    if lang:
-        return lang[:2].lower()
+    if lang: return lang[:2].lower()
     text = msg.get("text", "") or msg.get("caption", "")
     if text:
         cyr = sum(1 for c in text if "\u0400" <= c <= "\u04FF")
-        if cyr / max(len(text), 1) > 0.3:
-            return "ru"
+        if cyr / max(len(text), 1) > 0.3: return "ru"
     return "en"
 
 
+def _is_local_error(r: dict) -> bool:
+    if r.get("status") != "error": return False
+    msg = r.get("message", "").lower()
+    return any(s in msg for s in _LOCAL_ERR)
+
+
 def _extract_text(inner) -> str:
-    if isinstance(inner, str):
-        return _safe(inner[:4000])
-    if not isinstance(inner, dict):
-        return _safe(str(inner)[:500])
-    for k in ("answer", "translated", "post", "transcription", "summary",
-              "text", "content", "output", "message", "result", "data"):
+    if isinstance(inner, str): return _safe(inner[:4000])
+    if not isinstance(inner, dict): return _safe(str(inner)[:500])
+    for k in ("answer","translated","post","transcription","summary",
+              "text","content","output","message","result","data"):
         v = inner.get(k)
         if v and isinstance(v, str) and len(v.strip()) > 5:
-            if len(v) == 36 and v.count("-") == 4:
-                continue  # skip UUIDs
+            if len(v) == 36 and v.count("-") == 4: continue
             return _safe(v[:4000])
-    if inner.get("output_path") and inner.get("status") == "success":
-        return f"✅ Файл сохранён:\n<code>{inner['output_path']}</code>"
+    op = inner.get("output_path", "")
+    if op and inner.get("status") == "success":
+        return "\u2705 File saved on your device:\n<code>" + op + "</code>"
     parts = [v for k, v in inner.items()
-             if k not in _HIDDEN
-             and isinstance(v, str) and 5 < len(v) < 500
-             and not _KEY_RE.search(v)
+             if k not in _HIDDEN and isinstance(v, str)
+             and 5 < len(v) < 500 and not _KEY_RE.search(v)
              and not (len(v) == 36 and v.count("-") == 4)]
-    return _safe(parts[0][:4000]) if parts else "✅ Готово."
+    return _safe(parts[0][:4000]) if parts else "\u2705 Done."
 
-
-
-# Local-only experts that require filesystem/Pillow/ffmpeg on a real device
-_KNOWN_LOCAL_EXPERTS = {
-    "image_enhance", "improve_photo_quality",
-    "remove_background_local", "remove_bg_local",
-    "video_enhance", "video_upscale", "text_to_speech",
-    "transcribe_audio_file", "audio_to_text_free",
-    "pdf_edit", "edit_pdf", "merge_pdf", "split_pdf",
-    "organize_files", "file_organizer", "scan_folder",
-    "convert_file", "file_converter", "save_presentation_pptx",
-}
 
 async def handle_user_bot_update(token_hash: str, data: dict):
     try:
         async with get_session() as session:
             bot = (await session.execute(
-                select(Bot).where(
-                    Bot.token_hash == token_hash,
-                    Bot.is_active == True
-                )
+                select(Bot).where(Bot.token_hash == token_hash,
+                                  Bot.is_active == True)
             )).scalar_one_or_none()
             if not bot:
-                logger.warning(f"No active bot for hash={token_hash}")
+                logger.warning("No active bot for hash=%s", token_hash)
                 return
             raw = decrypt_token(bot.token_encrypted, settings.secret_key)
             utg = TelegramClient(raw)
@@ -154,197 +133,247 @@ async def handle_user_bot_update(token_hash: str, data: dict):
             elif cb := data.get("callback_query"):
                 await utg.answer_callback_query(cb["id"])
     except Exception as e:
-        logger.error(f"user_bot hash={token_hash}: {e}", exc_info=True)
+        logger.error("user_bot hash=%s: %s", token_hash, e, exc_info=True)
 
 
 async def _process(utg, bot, msg: dict, session):
+    """Main message handler. Single routing path, no redundancy."""
     cid = msg["chat"]["id"]
     raw_text = msg.get("text", "").strip()
     caption = msg.get("caption", "").strip()
 
-    mt = "text"
-    fid = None
+    mt, fid = "text", None
     if msg.get("photo"):
-        mt = "photo"
-        fid = msg["photo"][-1]["file_id"]
+        mt, fid = "photo", msg["photo"][-1]["file_id"]
     elif msg.get("video"):
-        mt = "video"
-        fid = msg["video"]["file_id"]
+        mt, fid = "video", msg["video"]["file_id"]
     elif msg.get("voice"):
-        mt = "voice"
-        fid = msg["voice"]["file_id"]
+        mt, fid = "voice", msg["voice"]["file_id"]
     elif msg.get("audio"):
-        mt = "audio"
-        fid = msg["audio"]["file_id"]
+        mt, fid = "audio", msg["audio"]["file_id"]
     elif msg.get("document"):
-        mt = "document"
-        fid = msg["document"]["file_id"]
+        mt, fid = "document", msg["document"]["file_id"]
 
     text = caption or raw_text
     if not text and mt != "text":
         text = _DEFAULT_INTENT[mt]
     if not text:
         return
-
     lang = _detect_lang(msg)
 
-    exps = (await session.execute(
+    exps = list((await session.execute(
         select(BotExpert)
         .where(BotExpert.bot_id == bot.id, BotExpert.is_active == True)
         .order_by(BotExpert.sort_order)
-    )).scalars().all()
+    )).scalars().all())
 
+    # /start /help
     if raw_text in ("/start", "/help"):
         if exps:
-            lines = "\n".join(f"• {e.display_name or e.expert_name}" for e in exps)
-            await utg.send_message(
-                cid,
-                f"👋 Работаю на базе <b>Extella AI</b>\n\n"
-                f"<b>Функции ({len(exps)}):</b>\n{lines}\n\n"
-                "Отправьте текст, фото, голосовое или файл!"
-            )
+            lines = "\n".join(f"\u2022 {e.display_name or e.expert_name}" for e in exps)
+            await utg.send_message(cid,
+                f"\U0001f44b Powered by <b>Extella AI</b>\n\n"
+                f"<b>Functions ({len(exps)}):</b>\n{lines}\n\n"
+                "Send text, photo, voice or file!")
         else:
-            await utg.send_message(cid, "👋 Бот настраивается.")
+            await utg.send_message(cid, "\U0001f44b Bot is being set up.")
         return
 
     if not exps:
-        await utg.send_message(cid, "Бот ещё не настроен.")
+        await utg.send_message(cid, "Bot not configured yet.")
         return
 
+    # Resolve file URL
     furl = None
     if fid:
         furl = await utg.get_file_url(fid)
         if not furl:
-            await utg.send_message(cid, "⚠️ Не удалось загрузить файл.")
+            await utg.send_message(cid, "\u26a0\ufe0f Could not load file.")
             return
 
     await utg.send_chat_action(cid, _CHAT_ACTION.get(mt, "typing"))
 
-    query = f"{text} {_MEDIA_HINT.get(mt, '')}".strip()
-    # ── ORCHESTRATOR: try GPT-4o-mini routing first ─────────────────
-    import json as _json
-    _openai_key = getattr(settings, 'openai_api_key', '')
-    _orch_best = None
-    _orch_params = None
-    if _openai_key and len(exps) > 1:
-        try:
-            _exp_info = []
-            for _e in exps:
-                _kw = await extella.get_expert_kwargs(_e.expert_name)
-                _exp_info.append({'name': _e.expert_name,
-                    'description': _e.display_name or _e.expert_name,
-                    'kwargs': {k: '' for k in _kw}})
-            _or = await extella.run_expert('mb_orchestrator', {
-                'user_message': text, 'experts_json': _json.dumps(_exp_info),
-                'api_key': _openai_key, 'media_type': mt,
-                'file_url': furl or '', 'language': lang,
-            }, wait=True, timeout=15)
-            _ri = _or.get('result', {})
-            if isinstance(_ri, str):
-                import ast as _ast
-                try: _ri = _ast.literal_eval(_ri)
-                except: pass
-            if isinstance(_ri, dict) and _ri.get('status') == 'success':
-                _en = _ri.get('expert_name', '')
-                _oe = next((e for e in exps if e.expert_name == _en), None)
-                if _oe:
-                    _orch_best = _oe
-                    _rt = decrypt_token(bot.token_encrypted, settings.secret_key)
-                    _orch_params = _ri.get('params', {})
-                    _orch_params['__tg_bot_token__'] = _rt
-                    _orch_params['__tg_chat_id__'] = str(cid)
-                    logger.info('[ORCH] %s -> %s | %s', text[:40],
-                                _en, _ri.get('reasoning','')[:60])
-        except Exception as _oe:
-            logger.warning('[ORCH] fallback: %s', _oe)
+    # ── SINGLE ROUTING DECISION ──────────────────────────────────────
+    best, params = await _route_and_build(bot, exps, text, mt, furl, lang, cid)
 
-    best = await _route(exps, query)
-    logger.info(f"bot={bot.id} expert={best.expert_name} mt={mt} lang={lang}")
+    # ── EXECUTION ────────────────────────────────────────────────────
+    result = await _execute(bot, best, params)
 
-    allowed_kwargs = await extella.get_expert_kwargs(best.expert_name)
-    logger.info("[PARAMS] %s accepts %d kwargs",best.expert_name,len(allowed_kwargs))
-    params = _build_params(bot, best, text, mt, furl, lang, cid, allowed_kwargs)
-
-    # Apply orchestrator result if available
-    if _orch_best and _orch_params:
-        best = _orch_best
-        params = _orch_params
-        logger.info('[ORCH] override to %s', best.expert_name)
-
-    # ── Execute ───────────────────────────────────────────────────────────────
-    # Determine if we have a valid device UUID (not "auto", not empty, proper UUID format)
-    tid = (bot.user_target_id or "").strip()
-    has_valid_device = (
-        len(tid) == 36 and tid.count("-") == 4 and tid != "auto"
-        and bot.user_extella_token_enc
-    )
-
-    # Check if this expert requires local machine (filesystem/Pillow/ffmpeg etc.)
-    is_local_expert = best.expert_name.lower() in _KNOWN_LOCAL_EXPERTS
-    if not is_local_expert:
-        desc = (best.display_name or "").lower()
-        name_l = best.expert_name.lower()
-        is_local_expert = any(w in name_l + " " + desc for w in [
-            "pillow", "opencv", "ffmpeg", "rembg", "ollama",
-            "output_path", "saves to", "local file",
-            "no api key needed", "subprocess", "filesystem",
-        ])
-
-    if is_local_expert and not has_valid_device:
-        # Local expert but no valid device UUID — ask user to provide it
-        await utg.send_message(
-            cid,
-            "\u26a0\ufe0f <b>" + (best.display_name or best.expert_name) + "</b> "
-            "requires your computer to run.\n\n"
-            "To connect your device:\n"
-            "1. Open <b>Extella Desktop</b>\n"
-            "2. Find your <b>Device UUID</b> in Settings\n"
-            "3. Use /connect in @extnickbot_bot and follow instructions\n\n"
-            "<i>Or ask Extella AI agent: "
-            "<code>What is my device UUID?</code></i>"
-        )
+    # Handle needs_device
+    if isinstance(result, dict) and result.get("status") == "needs_device":
+        exp_name = result.get("expert_name", best.display_name or best.expert_name)
+        await utg.send_message(cid,
+            f"\u26a0\ufe0f <b>{exp_name}</b> requires your device to run.\n\n"
+            "Connect via /connect in @extnickbot_bot.")
         return
 
-    if has_valid_device:
-        # PLATFORM TOKEN + user device UUID → runs on user's machine
-        # Platform token can access platform experts on any registered device
-        result = await extella.run_expert(
-            best.expert_name, params, wait=True, timeout=120,
-            target=tid,  # explicit valid UUID
-        )
-        if result.get("status") == "async":
-            logger.info(f"Device async for {best.expert_name}, noting for user")
-            # Result will be saved to ~/Downloads on user's machine
-    else:
-        # Serverless — no target (platform routes to remote workers)
-        result = await extella.run_expert(
-            best.expert_name, params, wait=True, timeout=90)
-
+    # ── RESPONSE ─────────────────────────────────────────────────────
     await _respond(utg, cid, result, len(exps) > 1, best.expert_name)
 
 
+async def _route_and_build(bot, exps, text, mt, furl, lang, cid):
+    """
+    Single routing decision. Returns (best_expert, params).
+    Paths:
+      - 1 expert       → direct (no routing, 1× get_kwargs)
+      - OpenAI key     → orchestrator (N× get_kwargs parallel + 1× orchestrator)
+      - fallback       → semantic search (1× search + 1× get_kwargs)
+    Each path makes exactly the minimum API calls needed.
+    """
+    # ── Path 1: single expert ─────────────────────────────────────
+    if len(exps) == 1:
+        best = exps[0]
+        allowed = await extella.get_expert_kwargs(best.expert_name)
+        params = _build_params(bot, best, text, mt, furl, lang, cid, allowed)
+        logger.info("[ROUTE] direct: %s", best.expert_name)
+        return best, params
+
+    # ── Path 2: orchestrator ──────────────────────────────────────
+    openai_key = getattr(settings, "openai_api_key", "")
+    if openai_key:
+        result = await _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key)
+        if result is not None:
+            logger.info("[ROUTE] orchestrated: %s", result[0].expert_name)
+            return result
+
+    # ── Path 3: semantic fallback ─────────────────────────────────
+    query = f"{text} {_MEDIA_HINT.get(mt, "")}".strip()
+    best = await _semantic_route(exps, query)
+    allowed = await extella.get_expert_kwargs(best.expert_name)
+    params = _build_params(bot, best, text, mt, furl, lang, cid, allowed)
+    logger.info("[ROUTE] semantic: %s", best.expert_name)
+    return best, params
+
+
+async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
+    """
+    Try GPT-4o-mini orchestrator.
+    Fetches all expert kwargs IN PARALLEL (asyncio.gather).
+    Returns (best, params) on success, None on timeout/error.
+    """
+    try:
+        # Parallel kwargs fetch — one round-trip for all experts
+        kwargs_results = await asyncio.gather(
+            *[extella.get_expert_kwargs(e.expert_name) for e in exps],
+            return_exceptions=True
+        )
+
+        expert_kwargs_map = {}
+        exp_info = []
+        for e, kw in zip(exps, kwargs_results):
+            kw_set = kw if isinstance(kw, set) else set()
+            expert_kwargs_map[e.expert_name] = kw_set
+            # Exclude internal params from orchestrator context
+            public = {k: "" for k in kw_set if not k.startswith("__")}
+            exp_info.append({
+                "name": e.expert_name,
+                "description": e.display_name or e.expert_name,
+                "kwargs": public,
+            })
+
+        # Call orchestrator (15s timeout)
+        orch_resp = await extella.run_expert("mb_orchestrator", {
+            "user_message": text,
+            "experts_json": json.dumps(exp_info),
+            "api_key": openai_key,
+            "media_type": mt,
+            "file_url": furl or "",
+            "language": lang,
+        }, wait=True, timeout=15)
+
+        # Parse response (Extella returns result as string or dict)
+        inner = orch_resp.get("result", {})
+        if isinstance(inner, str):
+            try: inner = json.loads(inner)
+            except Exception:
+                try: inner = _ast.literal_eval(inner)
+                except Exception: inner = {}
+
+        if not isinstance(inner, dict) or inner.get("status") != "success":
+            return None
+
+        orch_name = inner.get("expert_name", "")
+        best = next((e for e in exps if e.expert_name == orch_name), None)
+        if not best:
+            logger.warning("[ORCH] expert %r not in bot list", orch_name)
+            return None
+
+        # Build params from orchestrator extraction
+        raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
+        params = dict(inner.get("params", {}))
+
+        # Add internal delivery params
+        _INT = {"__tg_bot_token__", "__tg_chat_id__", "__railway_callback_url__"}
+        params["__tg_bot_token__"] = raw_tok
+        params["__tg_chat_id__"] = str(cid)
+        if settings.railway_url:
+            params["__railway_callback_url__"] = (
+                f"{settings.railway_url}/expert_result/{bot.token_hash}/{cid}"
+            )
+
+        # Inject user API keys (filtered to expert signature)
+        allowed = expert_kwargs_map.get(best.expert_name, set())
+        all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
+        for k, v in all_keys.items():
+            if k in allowed:
+                params[k] = v
+
+        # Strip anything expert doesnt accept (prevent TypeError)
+        if allowed:
+            params = {k: v for k, v in params.items()
+                      if k in allowed or k in _INT}
+
+        logger.info("[ORCH] %s \u2192 %s | %s",
+                    text[:40], best.expert_name, inner.get("reasoning", "")[:60])
+        return best, params
+
+    except Exception as e:
+        logger.warning("[ORCH] fallback to semantic: %s", e)
+        return None
+
+
+async def _semantic_route(exps: list, query: str):
+    """Semantic routing: exact → strong-word (7+ chars) → multi-word → first."""
+    if len(exps) == 1: return exps[0]
+    try:
+        ms = await extella.search_experts(query, limit=15)
+        by = {e.expert_name: e for e in exps}
+        for m in ms:
+            if m["name"] in by:
+                logger.info("Route exact: %s", m["name"])
+                return by[m["name"]]
+        for m in ms:
+            for w in (w for w in m["name"].split("_") if len(w) >= 7):
+                for bn, be in by.items():
+                    if w in bn:
+                        logger.info("Route strong-word: %s", bn)
+                        return be
+        for m in ms:
+            lw = {w for w in m["name"].split("_") if len(w) >= 5}
+            for bn, be in by.items():
+                bw = {w for w in bn.split("_") if len(w) >= 5}
+                if len(lw & bw) >= 2:
+                    logger.info("Route multi-word: %s", bn)
+                    return be
+    except Exception as e:
+        logger.warning("Semantic route error: %s", e)
+    return exps[0]
+
+
 def _build_params(bot, best, text: str, mt: str, furl,
-                  lang: str, chat_id: int, allowed_kwargs=None) -> dict:
-    """
-    Build params for expert call.
-    Strategy: inject everything potentially useful, then
-    if allowed_kwargs known — strip to exact expert signature.
-    This prevents ALL TypeError: unexpected keyword argument errors.
-    """
+                  lang: str, chat_id: int, allowed: set | None = None) -> dict:
+    """Build expert params, filtered to declared signature."""
     params = dict(best.params_json or {})
     pp = params.pop("__prompt_param__", "prompt")
 
-    # File URL — inject under all common param names
     if furl:
-        for k in ("image_url", "input_path", "file_url",
-                  "video_url", "audio_url", "input_url"):
+        for k in ("image_url","input_path","file_url","video_url","audio_url","input_url"):
             params[k] = furl
         if text != _DEFAULT_INTENT.get(mt, ""):
             params[pp] = text
     else:
         params[pp] = text
 
-    # Language hint
     inst = _LANG.get(lang, f"Respond in {lang}.")
     if "system_prompt" in params:
         sp = params.get("system_prompt", "")
@@ -352,55 +381,49 @@ def _build_params(bot, best, text: str, mt: str, furl,
             params["system_prompt"] = f"{sp}\n{inst}".strip()
     params["language"] = lang
 
-    # Internal Telegram delivery params
     raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
     params["__tg_bot_token__"] = raw_tok
     params["__tg_chat_id__"] = str(chat_id)
+    _INT = {"__tg_bot_token__", "__tg_chat_id__", "__railway_callback_url__"}
     if settings.railway_url:
         params["__railway_callback_url__"] = (
             f"{settings.railway_url}/expert_result/{bot.token_hash}/{chat_id}"
         )
 
-    # User-provided API keys (from /apikeys)
     all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
-    for k, v in all_keys.items():
-        params[k] = v
-
-    # ── KEY STEP: filter to expert signature ──────────────────────
-    # If we know what params the expert accepts, strip everything else.
-    # This prevents TypeError for any expert, no matter what we inject above.
-    if allowed_kwargs:
-        params = {k: v for k, v in params.items() if k in allowed_kwargs}
+    if allowed:
+        for k, v in all_keys.items():
+            if k in allowed:
+                params[k] = v
+        params = {k: v for k, v in params.items() if k in allowed or k in _INT}
     else:
-        # Signature unknown: safe fallback — remove platform keys only
-        params.pop("api_key", None)
-        params.pop("openai_api_key", None)
-
+        for k, v in all_keys.items():
+            if k not in ("api_key", "openai_api_key"):
+                params[k] = v
     return params
 
 
-async def _route(exps: list, query: str):
-    if len(exps) == 1:
-        return exps[0]
-    try:
-        ms = await extella.search_experts(query, limit=15)
-        by = {e.expert_name: e for e in exps}
-        for m in ms:
-            name = m["name"]
-            # Exact match
-            if name in by:
-                logger.info("Matched %s exact score=%s q=%s", name, m.get("score","?"), query[:35])
-                return by[name]
-            # Fuzzy: split library name into words, find bot expert containing same word
-            parts = [part for part in name.split("_") if len(part) >= 4]
-            for part in parts:
-                for bot_name, bot_exp in by.items():
-                    if part in bot_name:
-                        logger.info("Matched %s fuzzy via %s/%s q=%s", bot_name, name, part, query[:35])
-                        return bot_exp
-    except Exception as e:
-        logger.warning("Route fail: %s", e)
-    return exps[0]
+async def _execute(bot, best, params: dict) -> dict:
+    """Phase 1: serverless. Phase 2: device fallback on local error."""
+    result = await extella.run_expert(best.expert_name, params, wait=True, timeout=90)
+
+    if _is_local_error(result):
+        if bot.user_extella_token_enc:
+            logger.info("[EXEC] Phase 2 device fallback: %s", best.expert_name)
+            try:
+                user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+                local_cli = ExtellaClient(user_tok)
+                result = await local_cli.run_expert(
+                    best.expert_name, params, wait=True, timeout=120)
+            except Exception as e:
+                logger.error("Phase 2 error: %s", e)
+        else:
+            return {
+                "status": "needs_device",
+                "expert_name": best.display_name or best.expert_name,
+            }
+    return result
+
 
 async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
     """Universal result → Telegram delivery."""
@@ -417,20 +440,14 @@ async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
         await utg.send_message(cid, f"\u26a0\ufe0f {_safe(result.get('message', 'Error'))}")
         return
 
-    # Extella wraps expert return value in result field (may be string)
     inner = result.get("result", result)
 
-    # Parse string result — Extella serializes the expert's return dict as string
+    # Parse string result (Extella wraps dict as string repr)
     if isinstance(inner, str):
-        import json
-        try:
-            inner = json.loads(inner)
+        try: inner = json.loads(inner)
         except Exception:
-            import ast
-            try:
-                inner = ast.literal_eval(inner)
-            except Exception:
-                pass  # Keep as string
+            try: inner = _ast.literal_eval(inner)
+            except Exception: pass
 
     if not inner:
         await utg.send_message(cid, label + "No response. Please try again.")
@@ -441,82 +458,73 @@ async def _respond(utg, cid: int, result: dict, multi: bool, name: str):
         return
 
     if isinstance(inner, dict):
-        # Expert self-delivered — do nothing
-        if inner.get("sent_to_telegram"):
-            return
+        if inner.get("sent_to_telegram"): return
 
-        # Image URL
         iu = (inner.get("result_url") or inner.get("image_url")
               or inner.get("output_url") or inner.get("output_image_url"))
         if iu:
             await _send_media(utg, cid, iu, label + inner.get("message", "\u2705"), "photo")
             return
 
-        # Audio URL
         au = inner.get("audio_url") or inner.get("voice_url") or inner.get("tts_url")
         if au:
             await _send_media(utg, cid, au, label, "voice")
             return
 
-        # Video URL
         vu = inner.get("video_url") or inner.get("output_video_url")
         if vu:
             await _send_media(utg, cid, vu, label + "\u2705", "video")
             return
 
-        # File saved on device
         if inner.get("output_path") and inner.get("status") == "success":
             await utg.send_message(cid,
                 f"{label}\u2705 File saved on your device:\n"
                 f"\U0001f4c1 <code>{inner['output_path']}</code>")
             return
 
-    # Fallback: extract meaningful text
     await utg.send_message(cid, label + _extract_text(inner))
 
 
 async def _send_media(utg, cid: int, url: str, caption: str, media_type: str):
-    """Send media to Telegram. Tries direct URL, falls back to document/link."""
+    """Send media to Telegram. Tries URL directly, falls back gracefully."""
     import httpx
     size = 0
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
+        async with httpx.AsyncClient(timeout=8) as c:
             hr = await c.head(url, follow_redirects=True)
             size = int(hr.headers.get("content-length", 0))
     except Exception:
         pass
-    size_mb = size / 1024 / 1024
+    mb_size = size / 1024 / 1024
 
     if media_type == "photo":
-        if size_mb > 50:
-            await utg.send_message(
-                cid,
-                f"{caption}\n📎 Файл {size_mb:.1f}МБ — "
-                f'<a href="{url}">Скачать</a>')
+        if mb_size > 50:
+            await utg.send_message(cid,
+                f"{caption}\n\U0001f4ce File {mb_size:.1f}MB \u2014 "
+                f'<a href="{url}">Download</a>')
             return
         r = await utg.send_photo(cid, url, caption=caption)
-        if r.get("ok"):
-            return
+        if r.get("ok"): return
         r2 = await utg.send_document(cid, url, caption=caption)
         if not r2.get("ok"):
-            await utg.send_message(cid, f'{caption}\n🖼 <a href="{url}">Открыть</a>')
+            await utg.send_message(cid, f'{caption}\n\U0001f5bc <a href="{url}">Open</a>')
 
     elif media_type == "voice":
-        if size_mb > 50:
-            await utg.send_message(cid, f'🎵 <a href="{url}">Аудио</a>')
+        if mb_size > 50:
+            await utg.send_message(cid, f'\U0001f3b5 <a href="{url}">Audio</a>')
             return
         r = await utg.send_voice(cid, url)
         if not r.get("ok"):
             r2 = await utg.send_audio(cid, url, caption=caption)
             if not r2.get("ok"):
-                await utg.send_message(cid, f'🎵 <a href="{url}">Аудио</a>')
+                await utg.send_message(cid, f'\U0001f3b5 <a href="{url}">Audio</a>')
         elif caption.strip():
             await utg.send_message(cid, caption.strip())
 
     elif media_type == "video":
-        if size_mb > 50:
-            await utg.send_message(cid, f'{caption}\n🎬 <a href="{url}">Смотреть</a>')
+        if mb_size > 50:
+            await utg.send_message(cid, f'{caption}\n\U0001f3ac <a href="{url}">Watch</a>')
             return
         r = await utg.send_video(cid, url, caption=caption)
         if not r.get("ok"):
-            await utg.send_message(cid, f'{caption}\n🎬 <a href="{url}">Видео</a>')
+            await utg.send_message(cid, f'{caption}\n\U0001f3ac <a href="{url}">Watch</a>')
