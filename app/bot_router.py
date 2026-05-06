@@ -221,12 +221,55 @@ async def _process(utg, bot, msg: dict, session):
     await utg.send_chat_action(cid, _CHAT_ACTION.get(mt, "typing"))
 
     query = f"{text} {_MEDIA_HINT.get(mt, '')}".strip()
+    # ── ORCHESTRATOR: try GPT-4o-mini routing first ─────────────────
+    import json as _json
+    _openai_key = getattr(settings, 'openai_api_key', '')
+    _orch_best = None
+    _orch_params = None
+    if _openai_key and len(exps) > 1:
+        try:
+            _exp_info = []
+            for _e in exps:
+                _kw = await extella.get_expert_kwargs(_e.expert_name)
+                _exp_info.append({'name': _e.expert_name,
+                    'description': _e.display_name or _e.expert_name,
+                    'kwargs': {k: '' for k in _kw}})
+            _or = await extella.run_expert('mb_orchestrator', {
+                'user_message': text, 'experts_json': _json.dumps(_exp_info),
+                'api_key': _openai_key, 'media_type': mt,
+                'file_url': furl or '', 'language': lang,
+            }, wait=True, timeout=15)
+            _ri = _or.get('result', {})
+            if isinstance(_ri, str):
+                import ast as _ast
+                try: _ri = _ast.literal_eval(_ri)
+                except: pass
+            if isinstance(_ri, dict) and _ri.get('status') == 'success':
+                _en = _ri.get('expert_name', '')
+                _oe = next((e for e in exps if e.expert_name == _en), None)
+                if _oe:
+                    _orch_best = _oe
+                    _rt = decrypt_token(bot.token_encrypted, settings.secret_key)
+                    _orch_params = _ri.get('params', {})
+                    _orch_params['__tg_bot_token__'] = _rt
+                    _orch_params['__tg_chat_id__'] = str(cid)
+                    logger.info('[ORCH] %s -> %s | %s', text[:40],
+                                _en, _ri.get('reasoning','')[:60])
+        except Exception as _oe:
+            logger.warning('[ORCH] fallback: %s', _oe)
+
     best = await _route(exps, query)
     logger.info(f"bot={bot.id} expert={best.expert_name} mt={mt} lang={lang}")
 
     allowed_kwargs = await extella.get_expert_kwargs(best.expert_name)
     logger.info("[PARAMS] %s accepts %d kwargs",best.expert_name,len(allowed_kwargs))
     params = _build_params(bot, best, text, mt, furl, lang, cid, allowed_kwargs)
+
+    # Apply orchestrator result if available
+    if _orch_best and _orch_params:
+        best = _orch_best
+        params = _orch_params
+        logger.info('[ORCH] override to %s', best.expert_name)
 
     # ── Execute ───────────────────────────────────────────────────────────────
     # Determine if we have a valid device UUID (not "auto", not empty, proper UUID format)
