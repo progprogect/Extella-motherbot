@@ -282,23 +282,34 @@ async def _process(utg, bot, msg: dict, session):
 
 def _build_params(bot, best, text: str, mt: str, furl,
                   lang: str, chat_id: int, allowed_kwargs=None) -> dict:
-    """Filter params to expert signature — prevents TypeError."""
+    """
+    Build params for expert call.
+    Strategy: inject everything potentially useful, then
+    if allowed_kwargs known — strip to exact expert signature.
+    This prevents ALL TypeError: unexpected keyword argument errors.
+    """
     params = dict(best.params_json or {})
     pp = params.pop("__prompt_param__", "prompt")
+
+    # File URL — inject under all common param names
     if furl:
-        for k in ("image_url","input_path","file_url","video_url","audio_url","input_url"):
+        for k in ("image_url", "input_path", "file_url",
+                  "video_url", "audio_url", "input_url"):
             params[k] = furl
         if text != _DEFAULT_INTENT.get(mt, ""):
             params[pp] = text
     else:
         params[pp] = text
+
+    # Language hint
     inst = _LANG.get(lang, f"Respond in {lang}.")
     if "system_prompt" in params:
         sp = params.get("system_prompt", "")
         if inst not in sp:
             params["system_prompt"] = f"{sp}\n{inst}".strip()
-    if "language" not in params:
-        params["language"] = lang
+    params["language"] = lang
+
+    # Internal Telegram delivery params
     raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
     params["__tg_bot_token__"] = raw_tok
     params["__tg_chat_id__"] = str(chat_id)
@@ -306,16 +317,22 @@ def _build_params(bot, best, text: str, mt: str, furl,
         params["__railway_callback_url__"] = (
             f"{settings.railway_url}/expert_result/{bot.token_hash}/{chat_id}"
         )
+
+    # User-provided API keys (from /apikeys)
     all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
-    _INT = {"__tg_bot_token__","__tg_chat_id__","__railway_callback_url__"}
+    for k, v in all_keys.items():
+        params[k] = v
+
+    # ── KEY STEP: filter to expert signature ──────────────────────
+    # If we know what params the expert accepts, strip everything else.
+    # This prevents TypeError for any expert, no matter what we inject above.
     if allowed_kwargs:
-        for k,v in all_keys.items():
-            if k in allowed_kwargs: params[k] = v
-        params = {k:v for k,v in params.items()
-                  if k in allowed_kwargs or k in _INT}
+        params = {k: v for k, v in params.items() if k in allowed_kwargs}
     else:
-        for k,v in all_keys.items():
-            if k not in ("api_key","openai_api_key"): params[k] = v
+        # Signature unknown: safe fallback — remove platform keys only
+        params.pop("api_key", None)
+        params.pop("openai_api_key", None)
+
     return params
 
 
