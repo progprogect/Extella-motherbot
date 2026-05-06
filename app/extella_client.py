@@ -2,15 +2,16 @@ import httpx
 import logging
 logger = logging.getLogger(__name__)
 EXTELLA_BASE = "https://api.extella.ai"
+_PROFILE_ID = "default"
+_AGENT_ID   = "agent_extella_default"
 
 
-def _h(token: str) -> dict:
-    """All Extella API requests require these 3 headers (Dronor v0.5.3+)."""
+def _headers(token: str) -> dict:
     return {
-        "X-Auth-Token":  token,
-        "X-Profile-Id":  "default",
-        "X-Agent-Id":    "agent_extella_default",
-        "Content-Type":  "application/json",
+        "X-Auth-Token": token,
+        "X-Profile-Id": _PROFILE_ID,
+        "X-Agent-Id":   _AGENT_ID,
+        "Content-Type": "application/json",
     }
 
 
@@ -18,87 +19,73 @@ class ExtellaClient:
     def __init__(self, token: str):
         self.token = token
 
-    async def search_experts(self, query: str, limit: int = 10) -> list[dict]:
+    def _h(self) -> dict:
+        return _headers(self.token)
+
+    async def get_expert_kwargs(self, name: str) -> set:
+        """Returns set of kwarg names the expert accepts. Empty on error."""
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.post(
+                    f"{EXTELLA_BASE}/api/expert/get",
+                    headers=self._h(), json={"name": name},
+                )
+                if r.status_code == 200:
+                    params = r.json().get("expert_params", {}) or {}
+                    return set(params.keys())
+        except Exception as e:
+            logger.warning("get_expert_kwargs(%s): %s", name, e)
+        return set()
+
+    async def search_experts(self, query: str, limit: int = 10) -> list:
         try:
             async with httpx.AsyncClient(timeout=15) as c:
                 r = await c.post(f"{EXTELLA_BASE}/api/blocks/search",
-                    headers=_h(self.token),
-                    json={"query": query, "limit": limit})
+                    headers=self._h(), json={"query": query, "limit": limit})
                 r.raise_for_status()
                 return r.json().get("matches", [])
         except Exception as e:
-            logger.error(f"search_experts: {e}")
+            logger.error("search_experts: %s", e)
             return []
 
-    async def run_expert(self, expert_name: str, params: dict | None = None,
-                         wait: bool = True, timeout: int = 90,
-                         target: str | None = None) -> dict:
-        payload: dict = {
-            "expert_name": expert_name,
-            "params": params or {},
-            "wait": wait,
-        }
-        # Only include target if it's a non-empty string
-        if target and isinstance(target, str) and target.strip():
-            payload["target"] = target.strip()
-
+    async def run_expert(self, expert_name: str, params=None,
+                         wait: bool = True, timeout: int = 90, target=None) -> dict:
+        payload = {"expert_name": expert_name, "params": params or {}, "wait": wait}
+        if target:
+            payload["target"] = target
         try:
             async with httpx.AsyncClient(timeout=timeout + 10) as c:
                 r = await c.post(f"{EXTELLA_BASE}/api/expert/run",
-                    headers=_h(self.token), json=payload)
+                    headers=self._h(), json=payload)
                 r.raise_for_status()
                 resp = r.json()
             if resp.get("task_id") and not resp.get("result"):
-                logger.warning(f"Expert {expert_name} returned task_id (async)")
                 return {"status": "async", "task_id": resp.get("task_id"),
                         "expert_name": expert_name}
             return resp
         except httpx.TimeoutException:
-            return {"status": "error",
-                    "message": f"Expert '{expert_name}' timed out ({timeout}s)"}
+            return {"status": "error", "message": f"Timed out ({timeout}s)"}
         except httpx.HTTPStatusError as e:
-            body = ""
-            try: body = e.response.text[:200]
-            except Exception: pass
-            return {"status": "error",
-                    "message": f"Extella API HTTP {e.response.status_code}: {body}"}
+            return {"status": "error", "message": f"HTTP {e.response.status_code}"}
         except Exception as e:
-            logger.error(f"run_expert({expert_name}): {e}")
             return {"status": "error", "message": str(e)}
 
     async def validate_token(self, token: str) -> bool:
-        """
-        Validate an Extella API token.
-        API expects: POST /api/token/validate with body {"token": "<token>"}
-        """
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(
-                    f"{EXTELLA_BASE}/api/token/validate",
-                    headers=_h(token),
-                    json={"token": token},   # ← token must be in body
-                )
-                data = r.json()
-                return (data.get("valid") is True
-                        or data.get("status") == "success")
-        except Exception as e:
-            logger.error(f"validate_token: {e}")
+                r = await c.post(f"{EXTELLA_BASE}/api/token/validate",
+                                 headers=_headers(token), json={})
+                d = r.json()
+                return d.get("valid", False) or d.get("status") == "success"
+        except Exception:
             return False
 
-    async def list_targets(self, token: str) -> list[dict]:
-        """
-        List devices registered for the given token's user.
-        Returns list of {id, target, description} dicts.
-        """
+    async def list_targets(self, token: str) -> list:
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(
-                    f"{EXTELLA_BASE}/api/targets/list",
-                    headers=_h(token),
-                    json={},
-                )
-                data = r.json()
-                return data.get("results", [])
+                r = await c.post(f"{EXTELLA_BASE}/api/targets/list",
+                                 headers=_headers(token), json={})
+                return r.json().get("results", [])
         except Exception as e:
-            logger.error(f"list_targets: {e}")
+            logger.error("list_targets: %s", e)
             return []

@@ -224,7 +224,9 @@ async def _process(utg, bot, msg: dict, session):
     best = await _route(exps, query)
     logger.info(f"bot={bot.id} expert={best.expert_name} mt={mt} lang={lang}")
 
-    params = _build_params(bot, best, text, mt, furl, lang, cid)
+    allowed_kwargs = await extella.get_expert_kwargs(best.expert_name)
+    logger.info("[PARAMS] %s accepts %d kwargs",best.expert_name,len(allowed_kwargs))
+    params = _build_params(bot, best, text, mt, furl, lang, cid, allowed_kwargs)
 
     # ── Execute ───────────────────────────────────────────────────────────────
     # Determine if we have a valid device UUID (not "auto", not empty, proper UUID format)
@@ -278,65 +280,42 @@ async def _process(utg, bot, msg: dict, session):
     await _respond(utg, cid, result, len(exps) > 1, best.expert_name)
 
 
-def _build_params(bot, best, text: str, mt: str, furl: str | None,
-                  lang: str, chat_id: int) -> dict:
-    """Build params dict — injects ALL available keys + media + language."""
+def _build_params(bot, best, text: str, mt: str, furl,
+                  lang: str, chat_id: int, allowed_kwargs=None) -> dict:
+    """Filter params to expert signature — prevents TypeError."""
     params = dict(best.params_json or {})
     pp = params.pop("__prompt_param__", "prompt")
-
-    # Media
     if furl:
-        uk = {
-            "photo":    "image_url",
-            "video":    "video_url",
-            "voice":    "audio_url",
-            "audio":    "audio_url",
-            "document": "file_url",
-        }.get(mt, "file_url")
-        params[uk] = furl
-        is_filler = text == _DEFAULT_INTENT.get(mt, "")
-        if not is_filler and pp != uk:
+        for k in ("image_url","input_path","file_url","video_url","audio_url","input_url"):
+            params[k] = furl
+        if text != _DEFAULT_INTENT.get(mt, ""):
             params[pp] = text
     else:
         params[pp] = text
-
-    # Smart API key injection:
-    # Only inject api_key/openai_api_key for AI/LLM experts.
-    # Prevents TypeError: unexpected keyword argument 'api_key' in non-AI experts.
-    all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
-    exp_desc = (best.display_name or best.expert_name or "").lower()
-    needs_ai_keys = any(w in exp_desc for w in [
-        "openai", "gpt", "llm", "ai", "translate", "summariz",
-        "transcrib", "whisper", "anthropic", "claude", "replicate",
-        "fal", "image generat", "stable diffusion", "dall",
-        "answer", "question", "chat", "post", "caption",
-    ])
-    safe_user_keys = {k: v for k, v in all_keys.items()
-                      if k not in ("api_key", "openai_api_key")}
-    params.update(safe_user_keys)
-    if needs_ai_keys:
-        for k in ("api_key", "openai_api_key"):
-            if k in all_keys:
-                params[k] = all_keys[k]
-
-    # Language
-    inst = _LANG.get(lang, f"Respond in {lang} language.")
+    inst = _LANG.get(lang, f"Respond in {lang}.")
     if "system_prompt" in params:
         sp = params.get("system_prompt", "")
         if inst not in sp:
             params["system_prompt"] = f"{sp}\n{inst}".strip()
     if "language" not in params:
         params["language"] = lang
-
-    # Callback info — experts that support async result delivery can use this
-    raw_bot_token = decrypt_token(bot.token_encrypted, settings.secret_key)
-    params["__tg_bot_token__"] = raw_bot_token
+    raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
+    params["__tg_bot_token__"] = raw_tok
     params["__tg_chat_id__"] = str(chat_id)
     if settings.railway_url:
         params["__railway_callback_url__"] = (
             f"{settings.railway_url}/expert_result/{bot.token_hash}/{chat_id}"
         )
-
+    all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
+    _INT = {"__tg_bot_token__","__tg_chat_id__","__railway_callback_url__"}
+    if allowed_kwargs:
+        for k,v in all_keys.items():
+            if k in allowed_kwargs: params[k] = v
+        params = {k:v for k,v in params.items()
+                  if k in allowed_kwargs or k in _INT}
+    else:
+        for k,v in all_keys.items():
+            if k not in ("api_key","openai_api_key"): params[k] = v
     return params
 
 
