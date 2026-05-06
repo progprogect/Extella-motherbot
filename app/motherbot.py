@@ -133,6 +133,10 @@ async def _handle_message(msg: dict):
             await _mgr_del_wrap(cid, text, u, s)
         elif u.state == 'waiting_edit_description':
             await _mgr_edit_wrap(cid, text, u, s)
+        elif u.state == 'waiting_delete_confirm':
+            await _mgr_del_wrap(cid, text, u, s)
+        elif u.state == 'waiting_edit_description':
+            await _mgr_edit_wrap(cid, text, u, s)
         else: await motherbot.send_message(cid, "Use /start or /mybots")
 
 
@@ -437,6 +441,23 @@ async def _mgr_edit_wrap(cid, text, u, s):
     await _mgr_edit(cid, text, u, s, bot, motherbot, extella,
         BotExpert, _is_local, _clean_desc, _detect_prompt_param, _build_expert_kb)
 
+
+async def _mgr_del_wrap(cid, text, u, s):
+    bid = u.pending_bot_id
+    if not bid: await motherbot.send_message(cid, '/start'); return
+    bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
+    if not bot: await motherbot.send_message(cid, '/start'); return
+    await _mgr_del(cid, text, u, s, bot, motherbot, extella,
+        TelegramClient, decrypt_token, BotExpert, settings)
+
+async def _mgr_edit_wrap(cid, text, u, s):
+    bid = u.pending_bot_id
+    if not bid: await motherbot.send_message(cid, '/start'); return
+    bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
+    if not bot: await motherbot.send_message(cid, '/start'); return
+    await _mgr_edit(cid, text, u, s, bot, motherbot, extella,
+        BotExpert, _is_local, _clean_desc, _detect_prompt_param, _build_expert_kb)
+
 async def _do_activate(cid, u, s, bot, exps, message_id=None):
     raw = decrypt_token(bot.token_encrypted, settings.secret_key)
     wh = await TelegramClient(raw).set_webhook(
@@ -604,10 +625,12 @@ async def _handle_callback(cb: dict):
             keys = get_bot_keys(bot, settings.secret_key)
             rows = [
                 [{"text": "✏️ Edit Functions", "callback_data": f"edit|{bid}"}],
+                [{"text": "✏️ Edit Functions", "callback_data": f"edit|{bid}"}],
                 [{"text": "\U0001f511 Manage API Keys", "callback_data": f"manage_keys|{bid}"}],
                 [{"text": "\U0001f517 Connect Device/Server",
                   "callback_data": f"mode_desktop|{bid}"}],
                 [{"text": "\U0001f5d1 Deactivate", "callback_data": f"deactivate|{bid}"}],
+                [{"text": "🗑 Delete Bot", "callback_data": f"delete_bot|{bid}"}],
                 [{"text": "🗑 Delete Bot", "callback_data": f"delete_bot|{bid}"}],
             ]
             await motherbot.answer_callback_query(cbid)
@@ -625,6 +648,37 @@ async def _handle_callback(cb: dict):
                 "\U0001f511 Send key: <code>name: value</code>",
                 reply_markup={"inline_keyboard": [[
                     {"text": "\u25c0\ufe0f Cancel", "callback_data": "cancel_key"}]]})
+        elif action == "edit" and len(parts) == 2:
+            bid = int(parts[1])
+            bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
+            if not bot or bot.user_telegram_id != tid:
+                await motherbot.answer_callback_query(cbid, 'Not found'); return
+            u.state = 'waiting_edit_description'; u.pending_bot_id = bid
+            await s.flush(); await motherbot.answer_callback_query(cbid)
+            exps = (await s.execute(select(BotExpert).where(
+                BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
+            cur = ', '.join(e.display_name or e.expert_name for e in exps[:3])
+            em = '✏️ <b>Edit @' + bot.bot_username + '</b>' + chr(10) + chr(10)
+            em += 'Current: <i>' + cur + '</i>' + chr(10) + chr(10)
+            em += 'Describe new functionality:' + chr(10) + '✍️ <b>What should your bot do now?</b>'
+            await motherbot.send_message(cid, em)
+
+        elif action == "delete_bot" and len(parts) == 2:
+            bid = int(parts[1])
+            bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
+            if not bot or bot.user_telegram_id != tid:
+                await motherbot.answer_callback_query(cbid, 'Not found'); return
+            u.state = 'waiting_delete_confirm'; u.pending_bot_id = bid
+            await s.flush(); await motherbot.answer_callback_query(cbid)
+            dm = '🗑 <b>Delete @' + bot.bot_username + '?</b>' + chr(10) + chr(10)
+            dm += 'Removes all settings and webhook.' + chr(10)
+            dm += 'You can recreate it with the same token later.' + chr(10) + chr(10)
+            dm += 'Type <b>yes, delete</b> to confirm:'
+            await motherbot.send_message(cid, dm,
+                reply_markup={'inline_keyboard': [[
+                    {'text': '❌ Cancel', 'callback_data': 'cancel_key'}
+                ]]})
+
         elif action == "edit" and len(parts) == 2:
             bid = int(parts[1])
             bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
