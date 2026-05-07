@@ -333,29 +333,29 @@ async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
             return None
 
         # Build params from orchestrator extraction
-        raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
         params = dict(inner.get("params", {}))
-
-        # Add internal delivery params
-        _INT = {"__tg_bot_token__", "__tg_chat_id__", "__railway_callback_url__"}
-        params["__tg_bot_token__"] = raw_tok
-        params["__tg_chat_id__"] = str(cid)
-        if settings.railway_url:
-            params["__railway_callback_url__"] = (
-                f"{settings.railway_url}/expert_result/{bot.token_hash}/{cid}"
-            )
-
-        # Inject user API keys (filtered to expert signature)
         allowed = expert_kwargs_map.get(best.expert_name, set())
+
+        # Inject user API keys only if expert accepts them
         all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
         for k, v in all_keys.items():
             if k in allowed:
                 params[k] = v
 
-        # Strip anything expert doesnt accept (prevent TypeError)
+        # Internal delivery params — only pass if expert explicitly declares them
+        raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
+        _int_map = {"__tg_bot_token__": raw_tok, "__tg_chat_id__": str(cid)}
+        if settings.railway_url:
+            _int_map["__railway_callback_url__"] = (
+                f"{settings.railway_url}/expert_result/{bot.token_hash}/{cid}"
+            )
+        for k, v in _int_map.items():
+            if k in allowed:
+                params[k] = v
+
+        # Strip unknown params — prevents TypeError in expert (no **kwargs handling)
         if allowed:
-            params = {k: v for k, v in params.items()
-                      if k in allowed or k in _INT}
+            params = {k: v for k, v in params.items() if k in allowed}
 
         logger.info("[ORCH v2] %s → %s | conf=%.2f | %s",
                     text[:40], best.expert_name,
@@ -418,11 +418,9 @@ def _build_params(bot, best, text: str, mt: str, furl,
     params["language"] = lang
 
     raw_tok = decrypt_token(bot.token_encrypted, settings.secret_key)
-    params["__tg_bot_token__"] = raw_tok
-    params["__tg_chat_id__"] = str(chat_id)
-    _INT = {"__tg_bot_token__", "__tg_chat_id__", "__railway_callback_url__"}
+    _int_map = {"__tg_bot_token__": raw_tok, "__tg_chat_id__": str(chat_id)}
     if settings.railway_url:
-        params["__railway_callback_url__"] = (
+        _int_map["__railway_callback_url__"] = (
             f"{settings.railway_url}/expert_result/{bot.token_hash}/{chat_id}"
         )
 
@@ -431,7 +429,12 @@ def _build_params(bot, best, text: str, mt: str, furl,
         for k, v in all_keys.items():
             if k in allowed:
                 params[k] = v
-        params = {k: v for k, v in params.items() if k in allowed or k in _INT}
+        # Internal params only if expert explicitly declares them
+        for k, v in _int_map.items():
+            if k in allowed:
+                params[k] = v
+        # Strip everything not in allowed — prevents TypeError in expert
+        params = {k: v for k, v in params.items() if k in allowed}
     else:
         for k, v in all_keys.items():
             if k not in ("api_key", "openai_api_key"):
@@ -449,7 +452,12 @@ async def _execute(bot, best, params: dict) -> dict:
                 "expert_name": best.display_name or best.expert_name}
 
     user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
-    local_cli = ExtellaClient(user_tok)  # no service-level X-Profile-Id/X-Agent-Id
+    # X-Profile-Id and X-Agent-Id are required by Extella for ALL /api/expert/run calls
+    local_cli = ExtellaClient(user_tok, profile_id="default", agent_id="agent_extella_default")
+
+    public_param_keys = [k for k in params if not k.startswith("__")]
+    logger.info("[EXEC] calling %s | target=%s | params=%s",
+                best.expert_name, bot.user_target_id, public_param_keys)
 
     for attempt in range(1, 3):
         try:
