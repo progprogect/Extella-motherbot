@@ -478,6 +478,20 @@ async def _handle_server_token(cid, text, u, s):
     await _do_activate(cid, u, s, bot, list(exps))
 
 
+def _detect_key_name(value: str) -> str | None:
+    """Auto-detect API key type from its value format."""
+    v = value.strip()
+    if v.startswith("sk-proj-") or v.startswith("sk-"):
+        return "api_key"
+    if v.startswith("aafd") and len(v) > 30:
+        return "fal_api_key"
+    if v.startswith("sk-ant-"):
+        return "anthropic_api_key"
+    if v.startswith("r8_"):
+        return "replicate_api_token"
+    return None
+
+
 async def _handle_api_key_input(cid, text, u, s):
     bid = u.pending_bot_id
     if not bid: await motherbot.send_message(cid, "/start"); return
@@ -486,17 +500,39 @@ async def _handle_api_key_input(cid, text, u, s):
     if text.lower() in ("cancel","/cancel"):
         u.state = "active"; await s.flush()
         await motherbot.send_message(cid, "Cancelled."); return
+
+    text = text.strip()
     if ":" in text:
-        parts = text.split(":",1)
-        key_name = parts[0].strip().lower().replace(" ","_")
+        parts = text.split(":", 1)
+        key_name = parts[0].strip().lower().replace(" ", "_")
         key_value = parts[1].strip()
     elif u.pending_key_name:
-        key_name = u.pending_key_name; key_value = text.strip()
+        key_name = u.pending_key_name
+        key_value = text
     else:
-        await motherbot.send_message(cid, "\u274c Use format: <code>key_name: value</code>"); return
+        # Try auto-detect from value format (user just pasted the key)
+        auto_name = _detect_key_name(text)
+        if auto_name:
+            key_name = auto_name
+            key_value = text
+        else:
+            await motherbot.send_message(
+                cid,
+                "\u274c Could not detect key type. Please use format:\n"
+                "<code>api_key: sk-proj-your-openai-key</code>"
+            )
+            return
+
+    if not key_value:
+        await motherbot.send_message(cid, "\u274c Key value is empty."); return
+
     set_bot_key(bot, key_name, key_value, settings.secret_key)
     await s.flush()
-    await motherbot.send_message(cid, f"\u2705 Key <b>{key_name}</b> saved!")
+    await motherbot.send_message(
+        cid,
+        f"\u2705 Key <b>{key_name}</b> saved!\n\n"
+        f"Your bot will now use this key for experts that require it."
+    )
     u.state = "active"; u.pending_key_name = None; await s.flush()
 
 
@@ -576,14 +612,18 @@ async def _cmd_apikeys(cid, u, s):
     bot = bots[-1]
     u.state = "waiting_api_key_input"; u.pending_bot_id = bot.id; await s.flush()
     existing = get_bot_keys(bot, settings.secret_key)
+    stored_str = ", ".join(f"<code>{k}</code>" for k in existing.keys()) if existing else "none"
     await motherbot.send_message(cid,
         f"\U0001f511 <b>API keys for @{bot.bot_username}</b>\n\n"
-        f"Stored: {', '.join(existing.keys()) if existing else 'none'}\n\n"
-        "Send in format: <code>key_name: value</code>\n\n"
-        "Examples:\n"
-        "\u2022 <code>fal_api_key: aafd713e-...</code>\n"
-        "\u2022 <code>anthropic_api_key: sk-ant-...</code>\n"
-        "\u2022 <code>replicate_api_token: r8_...</code>",
+        f"Currently saved: {stored_str}\n\n"
+        "You can simply <b>paste your key</b> — I'll detect the type automatically.\n"
+        "Or use format: <code>key_name: value</code>\n\n"
+        "<b>Supported key types:</b>\n"
+        "\u2022 <b>OpenAI</b>: paste <code>sk-proj-...</code> or <code>api_key: sk-proj-...</code>\n"
+        "\u2022 <b>Fal.ai</b>: paste <code>aafd...</code> or <code>fal_api_key: aafd...</code>\n"
+        "\u2022 <b>Anthropic</b>: <code>anthropic_api_key: sk-ant-...</code>\n"
+        "\u2022 <b>Replicate</b>: <code>replicate_api_token: r8_...</code>\n"
+        "\u2022 <b>Any other</b>: <code>my_key_name: value</code>",
         reply_markup={"inline_keyboard": [[
             {"text": "\u25c0\ufe0f Cancel", "callback_data": "cancel_key"}]]})
 

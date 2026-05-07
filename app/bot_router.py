@@ -254,7 +254,9 @@ async def _route_and_build(bot, exps, text, mt, furl, lang, cid):
         return best, params
 
     # ── Path 2: orchestrator ──────────────────────────────────────
-    openai_key = getattr(settings, "openai_api_key", "")
+    # Per-bot user key takes priority over platform key (user controls their own billing)
+    _bot_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
+    openai_key = _bot_keys.get("api_key") or _bot_keys.get("openai_api_key") or ""
     if openai_key:
         result = await _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key)
         if result is not None:

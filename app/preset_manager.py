@@ -108,15 +108,17 @@ async def fetch_concept_text(concept_id: int, user_tok: str) -> str | None:
     """Fetch concept text by ID from user's Extella account."""
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
+            r = await c.post(
                 f"{EXTELLA_BASE}/api/concept/list",
                 headers=_api_headers(user_tok),
+                json={},
             )
             if r.status_code == 200:
-                concepts = r.json().get("concepts", r.json().get("results", []))
+                data = r.json()
+                concepts = data.get("results", data.get("concepts", []))
                 for c_item in concepts:
                     if c_item.get("concept_id") == concept_id or c_item.get("id") == concept_id:
-                        return c_item.get("text") or c_item.get("concept_text")
+                        return c_item.get("concept_text") or c_item.get("text")
     except Exception as e:
         logger.warning("[PRESET] fetch_concept_text error: %s", e)
     return None
