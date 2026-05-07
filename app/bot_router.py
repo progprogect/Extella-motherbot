@@ -370,11 +370,24 @@ async def _route_and_build(bot, exps, text, mt, furl, lang, cid):
       - OpenAI key     → orchestrator (N× get_kwargs parallel + 1× orchestrator)
       - fallback       → semantic search (1× search + 1× get_kwargs)
     Each path makes exactly the minimum API calls needed.
+
+    Expert schema lookups use the user's own token so private/custom experts
+    are accessible, falling back to service token only if user token is absent.
     """
+    # Build a user-scoped client for schema lookups so that experts accessible
+    # only under the user's account are correctly resolved.
+    user_cli: ExtellaClient
+    if bot.user_extella_token_enc:
+        _u_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+        user_cli = ExtellaClient(_u_tok, profile_id="default",
+                                 agent_id="agent_extella_default")
+    else:
+        user_cli = extella  # fallback: no user token yet
+
     # ── Path 1: single expert ─────────────────────────────────────
     if len(exps) == 1:
         best = exps[0]
-        allowed = await extella.get_expert_kwargs(best.expert_name)
+        allowed = await user_cli.get_expert_kwargs(best.expert_name)
         params = _build_params(bot, best, text, mt, furl, lang, cid, allowed)
         logger.info("[ROUTE] direct: %s", best.expert_name)
         return best, params
@@ -384,30 +397,34 @@ async def _route_and_build(bot, exps, text, mt, furl, lang, cid):
     _bot_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
     openai_key = _bot_keys.get("api_key") or _bot_keys.get("openai_api_key") or ""
     if openai_key:
-        result = await _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key)
+        result = await _try_orchestrator(bot, exps, text, mt, furl, lang, cid,
+                                         openai_key, user_cli)
         if result is not None:
             logger.info("[ROUTE] orchestrated: %s", result[0].expert_name)
             return result
 
     # ── Path 3: semantic fallback ─────────────────────────────────
-    query = f"{text} {_MEDIA_HINT.get(mt, "")}".strip()
+    query = f"{text} {_MEDIA_HINT.get(mt, '')}".strip()
     best = await _semantic_route(exps, query)
-    allowed = await extella.get_expert_kwargs(best.expert_name)
+    allowed = await user_cli.get_expert_kwargs(best.expert_name)
     params = _build_params(bot, best, text, mt, furl, lang, cid, allowed)
     logger.info("[ROUTE] semantic: %s", best.expert_name)
     return best, params
 
 
-async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
+async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key,
+                            user_cli: ExtellaClient | None = None):
     """
     Try mb_orchestrator_v2 with preset concept context.
-    Fetches all expert kwargs IN PARALLEL (asyncio.gather).
+    Fetches all expert kwargs IN PARALLEL (asyncio.gather) using the user's
+    own token so private experts are accessible.
     Returns (best, params) on success, None on timeout/error.
     """
+    _cli = user_cli or extella
     try:
-        # Parallel kwargs fetch — one round-trip for all experts
+        # Parallel kwargs fetch using user's token — one round-trip for all experts
         kwargs_results = await asyncio.gather(
-            *[extella.get_expert_kwargs(e.expert_name) for e in exps],
+            *[_cli.get_expert_kwargs(e.expert_name) for e in exps],
             return_exceptions=True
         )
 
