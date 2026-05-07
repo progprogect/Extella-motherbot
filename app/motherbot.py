@@ -46,18 +46,127 @@ def _is_local(*_) -> bool:
     return True
 
 
+# Experts that must never appear in user-facing bot configuration
+_EXPERT_BLOCKLIST: set[str] = {
+    # Personal / launcher utilities
+    "launch_conversation_assistant", "write_assistant_script",
+    "debug_conversation_assistant", "realtime_conversation_assistant",
+    # Low quality / broken
+    "temperature_converter", "text_analyzer",
+    # OS automation (not for bots)
+    "windows_agent", "mac_agent",
+    # Internal Telegram utilities
+    "send_telegram_message", "telegram_send", "telegram_bot_info",
+    "telegram_downloads_search_bot", "mb_get_tg_updates",
+    # Internal Motherbot orchestrators & deployment
+    "mb_orchestrator", "mb_orchestrator_v2",
+    # 3D / highly specialized pipelines
+    "generate_3d_pipeline", "generate_3d_model_huggingface",
+    # Internal automation & system tools
+    "automation_discovery", "design_critique",
+    # Voice cloning (requires heavy GPU, too specialized)
+    "voice_clone_tortoise", "voice_clone_xtts",
+    # Gaming / niche
+    "cs2_match_tracker",
+}
+_EXPERT_BLOCKLIST_PREFIXES = (
+    # Motherbot internal
+    "mb_test_", "mb_simulate_", "mb_push_", "mb_full_", "mb_add_", "mb_fix_",
+    # Twitter Lead Agent (entire suite is internal)
+    "tw_",
+    # Generic test/debug
+    "test_", "debug_",
+)
+
+# Descriptions starting with these indicate a broken/low-quality expert
+_BAD_DESC_PREFIXES = (
+    "the code needs", "the expert code", "the provided code",
+    "one sentence", "needs to be", "this expert needs",
+)
+
+# Canonical Motherbot experts — shown first, one per semantic slot
+_MB_PRIORITY = [
+    "mb_ai_assistant", "mb_translate_text", "mb_transcribe_voice",
+    "mb_image_generator", "image_generate", "text_to_speech",
+    "audio_to_text_free", "code_review_ai",
+]
+
+
+def _is_blocked(name: str, desc: str = "") -> bool:
+    """Return True if the expert should be hidden from users."""
+    if name in _EXPERT_BLOCKLIST:
+        return True
+    if any(name.startswith(p) for p in _EXPERT_BLOCKLIST_PREFIXES):
+        return True
+    if desc and any(desc.lower().startswith(p) for p in _BAD_DESC_PREFIXES):
+        return True
+    return False
+
+
+def _dedup_experts(matches: list, limit: int = 7) -> list:
+    """Filter blocklisted experts, deduplicate by semantic slot, prefer mb_* experts."""
+    seen_slots: dict[str, str] = {}  # slot_key → chosen expert name
+    slot_keywords = [
+        ("chat",      ("chat", "assistant", "gpt", "openai_chat", "ai_assistant", "mb_ai")),
+        ("translate", ("translat",)),
+        ("transcribe",("transcri", "whisper", "speech_to_text", "audio_to_text")),
+        ("tts",       ("tts", "text_to_speech")),
+        ("image",     ("image", "photo", "dall", "stable_diff", "flux", "logo",
+                       "generate_outfit", "interior_design", "background")),
+        ("video",     ("video",)),
+        ("code",      ("code_review", "code_explainer", "code_")),
+        ("social",    ("social", "twitter", "instagram", "linkedin")),
+        ("content",   ("content", "rewrite", "copywr", "post_gen")),
+        ("voice",     ("voice_clone", "clone")),
+        ("search",    ("search", "scrape", "crawl", "browse")),
+        ("file",      ("file_", "pdf_", "document", "ocr")),
+    ]
+
+    def get_slot(name: str) -> str:
+        nl = name.lower()
+        for slot, kws in slot_keywords:
+            if any(k in nl for k in kws):
+                return slot
+        return name  # unique slot per name = no dedup
+
+    priority_set = set(_MB_PRIORITY)
+    # Sort: priority experts first, then by score (already ordered by API)
+    sorted_matches = sorted(matches, key=lambda m: (0 if m["name"] in priority_set else 1, matches.index(m)))
+
+    result = []
+    for m in sorted_matches:
+        name = m["name"]
+        desc = m.get("description", "")
+        if _is_blocked(name, desc):
+            continue
+        slot = get_slot(name)
+        if slot in seen_slots:
+            continue  # already have an expert for this slot
+        seen_slots[slot] = name
+        result.append(m)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _clean_desc(desc: str) -> str:
-    for sep in [". Parameters:", "\nParameters:", " Parameters:"]:
+    """Extract clean first-sentence display name from expert description."""
+    # Cut before Parameters/Part-of section
+    for sep in [". Parameters:", "\nParameters:", " Parameters:", ". Part of"]:
         if sep in desc:
             desc = desc.split(sep)[0]
             break
-    return desc.strip()[:110]
+    # Take first sentence only
+    first = desc.split(".")[0].strip()
+    if len(first) >= 12:
+        return first[:100]
+    return desc.strip()[:100]
 
 
 def _detect_prompt_param(name: str, desc: str) -> str:
     n = name.lower()
     if "translat" in n: return "text"
-    if any(k in n for k in ("image","photo","background")): return "image_url"
+    if any(k in n for k in ("image", "photo", "background")): return "image_url"
     return "prompt"
 
 
@@ -115,10 +224,6 @@ async def _handle_message(msg: dict):
         elif u.state == "waiting_server_url": await _handle_server_url(cid, text, u, s)
         elif u.state == "waiting_server_token": await _handle_server_token(cid, text, u, s)
         elif u.state == "waiting_api_key_input": await _handle_api_key_input(cid, text, u, s)
-        elif u.state == 'waiting_delete_confirm':
-            await _mgr_del_wrap(cid, text, u, s)
-        elif u.state == 'waiting_edit_description':
-            await _mgr_edit_wrap(cid, text, u, s)
         elif u.state == 'waiting_delete_confirm':
             await _mgr_del_wrap(cid, text, u, s)
         elif u.state == 'waiting_edit_description':
@@ -189,12 +294,13 @@ async def _handle_desc(cid, text, u, s):
     if not bot: await motherbot.send_message(cid, "/start"); return
     await motherbot.send_message(cid,
         f"\U0001f50d Searching Extella library for <i>{text[:60]}</i>...")
-    matches = await extella.search_experts(text, limit=15)
+    raw = await extella.search_experts(text, limit=30)
+    matches = _dedup_experts(raw, limit=7)
     if not matches:
         await motherbot.send_message(cid,
             "\U0001f615 No experts found. Try rephrasing:\n"
             "\u2022 <i>AI assistant chatbot</i>\n"
-            "\u2022 <i>image processing</i>\n"
+            "\u2022 <i>image generation</i>\n"
             "\u2022 <i>text translation</i>\n"
             "\u2022 <i>voice transcription</i>")
         return
@@ -210,7 +316,7 @@ async def _handle_desc(cid, text, u, s):
     await s.flush()
     u.state = "choosing_experts"; await s.flush()
     selected = {m["name"] for m in matches}
-    exps_dicts = [{"name": m["name"], "description": m.get("description","")} for m in matches]
+    exps_dicts = [{"name": m["name"], "description": m.get("description", "")} for m in matches]
     legend = "\n\n\U0001f4bb All experts run locally on your device via Extella"
     await motherbot.send_message(cid,
         f"\U0001f3af <b>Found {len(matches)} experts</b>{legend}\n\n"

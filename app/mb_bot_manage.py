@@ -31,11 +31,13 @@ async def handle_edit_description(cid, text, u, s, bot_obj, motherbot, extella,
                                   BotExpert, _is_local, _clean_desc,
                                   _detect_prompt_param, _build_expert_kb):
     await motherbot.send_message(cid, f'🔍 Searching for <i>{text[:60]}</i>...')
-    matches = await extella.search_experts(text, limit=7)
+    raw = await extella.search_experts(text, limit=30)
+    from .motherbot import _dedup_experts
+    matches = _dedup_experts(raw, limit=7)
     if not matches:
         msg = '😕 No experts found. Try rephrasing:' + chr(10)
         msg += '• <i>AI assistant chatbot</i>' + chr(10)
-        msg += '• <i>image processing</i>' + chr(10)
+        msg += '• <i>image generation</i>' + chr(10)
         msg += '• <i>text translation</i>'
         await motherbot.send_message(cid, msg)
         return
