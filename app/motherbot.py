@@ -526,21 +526,31 @@ def _detect_key_name(value: str) -> str | None:
 
 def _parse_experts_from_concept(concept_text: str) -> list:
     """
-    Extract expert names from the EXPERTS: block in a concept text.
-    Handles format: '  - expert_name: description' or '  - expert_name'
+    Extract expert names from the EXPERTS: block/line in a concept text.
+    Handles two formats:
+      Inline:  EXPERTS: expert_a, expert_b, expert_c
+      Block:   EXPERTS:\n  - expert_a: description\n  - expert_b
     """
     names = []
     in_experts = False
     for line in concept_text.splitlines():
         stripped = line.strip()
         if stripped.startswith("EXPERTS:"):
+            # Check for inline format first: EXPERTS: a, b, c
+            inline_part = stripped[len("EXPERTS:"):].strip()
+            if inline_part:
+                for part in inline_part.split(","):
+                    name = part.strip().split(":")[0].strip()
+                    if name and re.match(r'^[a-z][a-z0-9_]{2,}$', name):
+                        names.append(name)
+                break  # inline format — done
             in_experts = True
             continue
         if in_experts:
-            # Stop at next all-caps section header or empty major section
-            if stripped and not stripped.startswith("-") and stripped.endswith(":") and stripped == stripped.upper():
-                break
+            # Stop at next section header
             if stripped.startswith("FLOW:") or stripped.startswith("RULES:") or stripped.startswith("BOT "):
+                break
+            if stripped and not stripped.startswith("-") and stripped.endswith(":") and stripped == stripped.upper():
                 break
             if stripped.startswith("-"):
                 name_part = stripped.lstrip("-").strip().split(":")[0].strip()
