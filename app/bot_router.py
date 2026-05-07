@@ -212,13 +212,24 @@ async def _process(utg, bot, msg: dict, session):
     # ── EXECUTION ────────────────────────────────────────────────────
     result = await _execute(bot, best, params)
 
-    # Handle needs_device
+    # Handle needs_device (no token/target configured at all)
     if isinstance(result, dict) and result.get("status") == "needs_device":
         exp_name = result.get("expert_name", best.display_name or best.expert_name)
         await utg.send_message(cid,
             f"\u26a0\ufe0f <b>Device not connected</b>\n\n"
             f"Expert <b>{exp_name}</b> runs locally via Extella Desktop.\n\n"
             "Please connect your device: send /connect to the Motherbot.")
+        return
+
+    # Handle device_offline (target registered but Extella Desktop not running)
+    if isinstance(result, dict) and result.get("status") == "device_offline":
+        exp_name = result.get("expert_name", best.display_name or best.expert_name)
+        await utg.send_message(cid,
+            f"\U0001f4bb <b>Your device is offline</b>\n\n"
+            f"Expert <b>{exp_name}</b> needs Extella Desktop running.\n\n"
+            "\u2022 Open Extella Desktop on your computer\n"
+            "\u2022 Make sure it's connected to the internet\n"
+            "\u2022 Then retry your message")
         return
 
     # ── RESPONSE ─────────────────────────────────────────────────────
@@ -446,6 +457,12 @@ async def _execute(bot, best, params: dict) -> dict:
                 best.expert_name, params,
                 target=bot.user_target_id, wait=True, timeout=120,
             )
+            msg = result.get("message", "")
+            # Detect device offline: Extella returns "Target X is unavailable"
+            if result.get("status") == "error" and "unavailable" in msg.lower() and "target" in msg.lower():
+                logger.warning("[EXEC] device offline for bot %s: %s", bot.id, msg)
+                return {"status": "device_offline",
+                        "expert_name": best.display_name or best.expert_name}
             if result.get("status") == "error" and attempt < 2:
                 logger.warning("[EXEC] attempt %d error, retrying: %s | %s",
                                attempt, best.expert_name, result.get("message", ""))
