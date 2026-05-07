@@ -38,6 +38,20 @@ class ExtellaClient:
             logger.warning("get_expert_kwargs(%s): %s", name, e)
         return set()
 
+    async def get_expert_params(self, name: str) -> dict:
+        """Returns full expert_params dict {param_name: default_val}. Empty on error."""
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.post(
+                    f"{EXTELLA_BASE}/api/expert/get",
+                    headers=self._h(), json={"name": name},
+                )
+                if r.status_code == 200:
+                    return r.json().get("expert_params", {}) or {}
+        except Exception as e:
+            logger.warning("get_expert_params(%s): %s", name, e)
+        return {}
+
     async def search_experts(self, query: str, limit: int = 15) -> list:
         """Semantic search across Extella expert library."""
         try:

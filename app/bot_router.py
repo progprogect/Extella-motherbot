@@ -22,13 +22,16 @@ import time
 import ast as _ast
 from sqlalchemy import select
 
-from .database import Bot, BotExpert, get_session
+from sqlalchemy import select as sa_select
+
+from .database import Bot, BotExpert, User, get_session
 from .telegram_client import TelegramClient
 from .extella_client import ExtellaClient
 from .crypto import decrypt_token
 from .config import settings
 from .key_manager import build_expert_params
 from .preset_manager import fetch_concept_text
+from .agentic_router import run_agentic_loop, _is_agent_guide
 from .mb_bot_manage import (
     handle_delete_confirm as _mgr_del,
     handle_edit_description as _mgr_edit,
@@ -206,6 +209,14 @@ async def _process(utg, bot, msg: dict, session):
 
     await utg.send_chat_action(cid, _CHAT_ACTION.get(mt, "typing"))
 
+    # ── AGENTIC PATH (concept has FLOW/EXPERTS block) ─────────────────
+    if bot.user_extella_token_enc and bot.preset_concept_id:
+        _user_tok_c = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+        _concept_text = await _get_cached_concept(bot.id, bot.preset_concept_id, _user_tok_c)
+        if _is_agent_guide(_concept_text):
+            await _process_agentic(utg, bot, msg, text, _concept_text, exps, cid, session)
+            return
+
     # ── SINGLE ROUTING DECISION ──────────────────────────────────────
     best, params = await _route_and_build(bot, exps, text, mt, furl, lang, cid)
 
@@ -234,6 +245,97 @@ async def _process(utg, bot, msg: dict, session):
 
     # ── RESPONSE ─────────────────────────────────────────────────────
     await _respond(utg, cid, result, len(exps) > 1, best.expert_name)
+
+
+_KEY_HINTS = {
+    "api_key": "OpenAI \u2014 <code>api_key: sk-proj-...</code>",
+    "fal_api_key": "Fal.ai \u2014 <code>fal_api_key: aafd...</code>",
+    "anthropic_api_key": "Anthropic \u2014 <code>anthropic_api_key: sk-ant-...</code>",
+    "replicate_api_token": "Replicate \u2014 <code>replicate_api_token: r8_...</code>",
+}
+
+
+async def _process_agentic(utg, bot, msg: dict, text: str,
+                            concept_text: str, exps: list,
+                            cid: int, session) -> None:
+    """Handle a user message through the agentic OpenAI function-calling loop."""
+    all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
+    openai_key = all_keys.get("api_key") or all_keys.get("openai_api_key") or settings.openai_api_key
+
+    if not openai_key:
+        logger.warning("[AGENT] no OpenAI key for bot %s, agentic path skipped", bot.id)
+        await utg.send_message(cid,
+            "\U0001f511 <b>OpenAI key required</b>\n\n"
+            "Please send your key via /apikeys:\n"
+            "<code>api_key: sk-proj-...</code>")
+        return
+
+    user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+    target_id = bot.user_target_id or ""
+
+    result = await run_agentic_loop(
+        bot=bot,
+        user_message=text,
+        concept_text=concept_text,
+        experts=exps,
+        user_tok=user_tok,
+        target_id=target_id,
+        openai_key=openai_key,
+        all_keys=all_keys,
+    )
+
+    status = result.get("status")
+
+    if status == "needs_device":
+        await utg.send_message(cid,
+            "\u26a0\ufe0f <b>Device not connected</b>\n\n"
+            "Your experts run locally via Extella Desktop.\n\n"
+            "Please connect your device: send /connect to the Motherbot.")
+        return
+
+    if status == "device_offline":
+        exp_name = result.get("expert_name", "")
+        await utg.send_message(cid,
+            f"\U0001f4bb <b>Your device is offline</b>\n\n"
+            f"Expert <b>{exp_name}</b> needs Extella Desktop running.\n\n"
+            "\u2022 Open Extella Desktop on your computer\n"
+            "\u2022 Make sure it\u2019s connected to the internet\n"
+            "\u2022 Then retry your message")
+        return
+
+    if status == "needs_key":
+        key_name = result.get("key_name", "api_key")
+        expert_name = result.get("expert_name", "")
+        hint = _KEY_HINTS.get(key_name, f"<code>{key_name}: ...</code>")
+
+        # Persist pending message so it replays after key is saved
+        tg_id = (msg.get("from") or {}).get("id")
+        if tg_id:
+            try:
+                user = (await session.execute(
+                    sa_select(User).where(User.telegram_id == tg_id)
+                )).scalar_one_or_none()
+                if user:
+                    user.pending_agent_message = text
+                    user.pending_agent_key_name = key_name
+                    user.pending_agent_bot_id = bot.id
+                    await session.flush()
+            except Exception as e:
+                logger.warning("[AGENT] could not save pending message: %s", e)
+
+        await utg.send_message(cid,
+            f"\U0001f511 <b>API key required</b>\n\n"
+            f"Expert <code>{expert_name}</code> needs a key to run.\n\n"
+            f"Please send your key in the format:\n{hint}\n\n"
+            f"<i>Your request will replay automatically after saving.</i>")
+        return
+
+    if status == "ok":
+        await utg.send_message(cid, _safe(result.get("text", "\u2705 Done.")))
+        return
+
+    # Generic error
+    await utg.send_message(cid, f"\u26a0\ufe0f {_safe(result.get('message', 'Error'))}")
 
 
 async def _route_and_build(bot, exps, text, mt, furl, lang, cid):

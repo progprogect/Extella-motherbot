@@ -8,8 +8,8 @@ from .telegram_client import TelegramClient
 from .extella_client import ExtellaClient
 from .crypto import encrypt_token, token_to_hash, decrypt_token
 from .config import settings
-from .key_manager import get_bot_keys, set_bot_key
-from .preset_manager import create_or_update_preset_concept
+from .key_manager import get_bot_keys, set_bot_key, build_expert_params
+from .preset_manager import create_or_update_preset_concept, search_concept_templates
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$")
@@ -294,6 +294,38 @@ async def _handle_desc(cid, text, u, s):
     if not bot: await motherbot.send_message(cid, "/start"); return
     await motherbot.send_message(cid,
         f"\U0001f50d Searching Extella library for <i>{text[:60]}</i>...")
+
+    # Try concept templates first (Agent Execution Guides with FLOW/EXPERTS blocks)
+    templates = await search_concept_templates(text, settings.extella_token, min_score=0.3)
+    best_tpl = templates[0] if templates else None
+
+    if best_tpl:
+        expert_names = _parse_experts_from_concept(best_tpl["concept_text"])
+        if expert_names:
+            bot.system_prompt = text
+            await s.execute(delete(BotExpert).where(BotExpert.bot_id == bid))
+            for i, name in enumerate(expert_names):
+                s.add(BotExpert(
+                    bot_id=bid, expert_name=name,
+                    display_name=name.replace("_", " ").title(),
+                    exec_type="local",
+                    params_json={"__prompt_param__": _detect_prompt_param(name, "")},
+                    is_active=True, sort_order=i,
+                ))
+            await s.flush()
+            u.state = "choosing_experts"; await s.flush()
+            selected = set(expert_names)
+            exps_dicts = [{"name": n, "description": n.replace("_", " ").title()}
+                          for n in expert_names]
+            title = best_tpl["title"].replace("PRESET:", "").strip()[:50]
+            legend = "\n\n\U0001f4bb All experts run locally on your device via Extella"
+            await motherbot.send_message(cid,
+                f"\u2728 <b>Matched template: {title}</b>{legend}\n\n"
+                "All selected \u2705 \u2014 tap to deselect.\nReady? Press <b>\U0001f680 Continue</b>",
+                reply_markup=_build_expert_kb(exps_dicts, selected, bid))
+            return
+
+    # Fallback: semantic expert search
     raw = await extella.search_experts(text, limit=30)
     matches = _dedup_experts(raw, limit=7)
     if not matches:
@@ -492,6 +524,31 @@ def _detect_key_name(value: str) -> str | None:
     return None
 
 
+def _parse_experts_from_concept(concept_text: str) -> list:
+    """
+    Extract expert names from the EXPERTS: block in a concept text.
+    Handles format: '  - expert_name: description' or '  - expert_name'
+    """
+    names = []
+    in_experts = False
+    for line in concept_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("EXPERTS:"):
+            in_experts = True
+            continue
+        if in_experts:
+            # Stop at next all-caps section header or empty major section
+            if stripped and not stripped.startswith("-") and stripped.endswith(":") and stripped == stripped.upper():
+                break
+            if stripped.startswith("FLOW:") or stripped.startswith("RULES:") or stripped.startswith("BOT "):
+                break
+            if stripped.startswith("-"):
+                name_part = stripped.lstrip("-").strip().split(":")[0].strip()
+                if name_part and re.match(r'^[a-z][a-z0-9_]{2,}$', name_part):
+                    names.append(name_part)
+    return names
+
+
 async def _handle_api_key_input(cid, text, u, s):
     bid = u.pending_bot_id
     if not bid: await motherbot.send_message(cid, "/start"); return
@@ -534,6 +591,90 @@ async def _handle_api_key_input(cid, text, u, s):
         f"Your bot will now use this key for experts that require it."
     )
     u.state = "active"; u.pending_key_name = None; await s.flush()
+
+    # Replay pending agentic message if user was mid-conversation in their bot
+    if u.pending_agent_message and u.pending_agent_bot_id:
+        await _replay_pending_agent_message(cid, u, s)
+
+
+async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
+    """Re-run the pending agentic message after the user provided a missing key."""
+    from .bot_router import _process_agentic, _get_cached_concept
+    from .agentic_router import _is_agent_guide
+
+
+    pending_text = u.pending_agent_message
+    agent_bot_id = u.pending_agent_bot_id
+
+    # Clear pending state first to avoid infinite replay loops
+    u.pending_agent_message = None
+    u.pending_agent_key_name = None
+    u.pending_agent_bot_id = None
+    await s.flush()
+
+    try:
+        bot = (await s.execute(select(Bot).where(Bot.id == agent_bot_id))).scalar_one_or_none()
+        if not bot or not bot.is_active:
+            return
+
+        if not bot.preset_concept_id or not bot.user_extella_token_enc:
+            return
+
+        user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+        concept_text = await _get_cached_concept(bot.id, bot.preset_concept_id, user_tok)
+        if not _is_agent_guide(concept_text):
+            return
+
+        from .database import BotExpert
+        from sqlalchemy import select as sa_select
+        exps = list((await s.execute(
+            sa_select(BotExpert).where(BotExpert.bot_id == bot.id, BotExpert.is_active == True)
+            .order_by(BotExpert.sort_order)
+        )).scalars().all())
+        if not exps:
+            return
+
+        # The child bot sends the reply to the user's Telegram ID (same as DM cid)
+        child_bot_cid = u.telegram_id
+        raw_bot_token = decrypt_token(bot.token_encrypted, settings.secret_key)
+        from .telegram_client import TelegramClient as TGClient
+        child_utg = TGClient(raw_bot_token)
+
+        await child_utg.send_chat_action(child_bot_cid, "typing")
+
+        all_keys = build_expert_params(bot, settings.secret_key, settings.openai_api_key)
+        openai_key = (all_keys.get("api_key") or all_keys.get("openai_api_key")
+                      or settings.openai_api_key)
+
+        from .agentic_router import run_agentic_loop
+        result = await run_agentic_loop(
+            bot=bot,
+            user_message=pending_text,
+            concept_text=concept_text,
+            experts=exps,
+            user_tok=user_tok,
+            target_id=bot.user_target_id or "",
+            openai_key=openai_key,
+            all_keys=all_keys,
+        )
+
+        from .bot_router import _safe
+        if result.get("status") == "ok":
+            await child_utg.send_message(child_bot_cid, _safe(result.get("text", "\u2705 Done.")))
+        elif result.get("status") in ("needs_device", "device_offline"):
+            await child_utg.send_message(child_bot_cid,
+                "\U0001f4bb Your device is offline. Please open Extella Desktop and retry.")
+        elif result.get("status") == "needs_key":
+            await child_utg.send_message(child_bot_cid,
+                f"\U0001f511 Another key is needed: "
+                f"<code>{result.get('key_name', 'api_key')}</code>\n"
+                "Use /apikeys in the Motherbot to add it.")
+        else:
+            await child_utg.send_message(child_bot_cid,
+                f"\u26a0\ufe0f {_safe(result.get('message', 'Error replaying your request.'))}")
+
+    except Exception as e:
+        logger.warning("[REPLAY] failed: %s", e)
 
 
 

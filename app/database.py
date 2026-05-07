@@ -25,6 +25,10 @@ class User(Base):
     state: Mapped[str] = mapped_column(String(50), default="start")
     pending_bot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pending_key_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Agentic router: stores user message awaiting a missing API key
+    pending_agent_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_agent_key_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    pending_agent_bot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
         onupdate=datetime.utcnow)
@@ -89,6 +93,9 @@ async def init_db():
             "ALTER TABLE bots ADD COLUMN IF NOT EXISTS preset_concept_id INTEGER",
             "ALTER TABLE bot_experts ADD COLUMN IF NOT EXISTS exec_type VARCHAR(10) DEFAULT 'local'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_key_name VARCHAR(50)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_agent_message TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_agent_key_name VARCHAR(100)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_agent_bot_id INTEGER",
         ]:
             try:
                 await conn.execute(sql_text(stmt))
