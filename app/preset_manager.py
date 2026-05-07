@@ -40,6 +40,16 @@ def _build_concept_text(system_prompt: str, experts: list) -> str:
     )
 
 
+def _api_headers(token: str) -> dict:
+    """Standard Extella API headers. X-Profile-Id is required by all concept/expert endpoints."""
+    return {
+        "X-Auth-Token": token,
+        "X-Profile-Id": "default",
+        "X-Agent-Id": "agent_extella_default",
+        "Content-Type": "application/json",
+    }
+
+
 async def create_or_update_preset_concept(
     bot,
     experts: list,
@@ -53,7 +63,7 @@ async def create_or_update_preset_concept(
     system_prompt = getattr(bot, "system_prompt", "") or "AI assistant bot"
     concept_text = _build_concept_text(system_prompt, experts)
 
-    headers = {"X-Auth-Token": user_tok, "Content-Type": "application/json"}
+    headers = _api_headers(user_tok)
 
     try:
         async with httpx.AsyncClient(timeout=15) as c:
@@ -96,7 +106,7 @@ async def fetch_concept_text(concept_id: int, user_tok: str) -> str | None:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
                 f"{EXTELLA_BASE}/api/concept/list",
-                headers={"X-Auth-Token": user_tok, "Content-Type": "application/json"},
+                headers=_api_headers(user_tok),
             )
             if r.status_code == 200:
                 concepts = r.json().get("concepts", r.json().get("results", []))
