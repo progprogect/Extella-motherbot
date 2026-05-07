@@ -227,6 +227,17 @@ async def _process(utg, bot, msg: dict, session):
     # ── EXECUTION ────────────────────────────────────────────────────
     result = await _execute(bot, best, params)
 
+    # Handle token_invalid (401 from Extella — token expired or not authorized)
+    if isinstance(result, dict) and result.get("status") == "token_invalid":
+        await utg.send_message(cid,
+            "\U0001f512 <b>Extella token invalid or expired</b>\n\n"
+            "Your Extella API token is no longer authorized to run experts.\n\n"
+            "To fix:\n"
+            "\u2022 Open Extella Desktop\n"
+            "\u2022 Generate a new token: <code>Generate an API token for me</code>\n"
+            "\u2022 Send /connect to the Motherbot and paste the new token")
+        return
+
     # Handle needs_device (no token/target configured at all)
     if isinstance(result, dict) and result.get("status") == "needs_device":
         exp_name = result.get("expert_name", best.display_name or best.expert_name)
@@ -289,6 +300,15 @@ async def _process_agentic(utg, bot, msg: dict, text: str,
     )
 
     status = result.get("status")
+
+    if status == "token_invalid":
+        await utg.send_message(cid,
+            "\U0001f512 <b>Extella token invalid or expired</b>\n\n"
+            "Your Extella API token is no longer authorized.\n\n"
+            "\u2022 Open Extella Desktop\n"
+            "\u2022 Generate a new token: <code>Generate an API token for me</code>\n"
+            "\u2022 Send /connect to the Motherbot and paste the new token")
+        return
 
     if status == "needs_device":
         await utg.send_message(cid,
@@ -581,6 +601,12 @@ async def _execute(bot, best, params: dict) -> dict:
                         "expert_name": best.display_name or best.expert_name}
             if result.get("status") == "error":
                 err_msg = result.get("message", "")
+                # 401 Unauthorized → token invalid/expired
+                if "401" in err_msg:
+                    logger.warning("[EXEC] token invalid (401) for bot %s expert %s",
+                                   bot.id, best.expert_name)
+                    return {"status": "token_invalid",
+                            "expert_name": best.display_name or best.expert_name}
                 # Only retry on 5xx server errors or timeout — not on 4xx (wrong params)
                 is_retryable = (
                     "timeout" in err_msg.lower()

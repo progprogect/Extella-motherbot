@@ -413,6 +413,20 @@ async def _handle_extella_token(cid, text, u, s):
             "Then paste the UUID token here."
         )
         return
+    # Check that the token actually has execute permissions (not just syntactically valid)
+    has_exec = await tmp.check_execute_permission(text)
+    if not has_exec:
+        await motherbot.send_message(
+            cid,
+            "\u26a0\ufe0f <b>Token accepted, but execution rights are missing</b>\n\n"
+            "This token passed basic validation but cannot run experts.\n\n"
+            "To get a full-access token:\n"
+            "\u2022 Open Extella Desktop\n"
+            "\u2022 Ask the AI agent: <code>Generate an API token for me</code>\n"
+            "\u2022 Paste the new token here\n\n"
+            "Or send /connect later once you have a valid token."
+        )
+        return
     # Try to find device UUID from targets list
     targets = await tmp.list_targets(text)
     target_id = None

@@ -113,15 +113,34 @@ class ExtellaClient:
         except Exception:
             return False
 
+    async def check_execute_permission(self, token: str) -> bool:
+        """
+        Verify the token can actually execute experts (not just pass validate_token).
+        Tests /api/expert/get which requires full API access.
+        Returns False if 401 (token has limited permissions).
+        """
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.post(
+                    f"{EXTELLA_BASE}/api/expert/get",
+                    headers=_headers(token, profile_id="default", agent_id="agent_extella_default"),
+                    json={"name": "mb_ai_assistant"},
+                )
+                return r.status_code != 401
+        except Exception:
+            return True  # Network error — assume ok, don't block user
+
     async def list_targets(self, token: str) -> list:
-        """List registered devices for the given token."""
+        """List registered devices for the given token. Returns (targets_list, is_authorized)."""
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(
                     f"{EXTELLA_BASE}/api/targets/list",
-                    headers=_headers(token),
+                    headers=_headers(token, profile_id="default", agent_id="agent_extella_default"),
                     json={},
                 )
+                if r.status_code == 401:
+                    return []
                 return r.json().get("results", [])
         except Exception as e:
             logger.error("list_targets: %s", e)

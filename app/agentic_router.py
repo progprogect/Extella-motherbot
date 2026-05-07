@@ -235,12 +235,17 @@ async def run_agentic_loop(
             except Exception as exc:
                 result = {"status": "error", "message": str(exc)}
 
-            # Pass device-level errors straight up the chain
-            if result.get("status") in ("needs_device", "device_offline"):
+            # Pass device-level and token errors straight up the chain
+            if result.get("status") in ("needs_device", "device_offline", "token_invalid"):
                 return result
 
             # Detect missing key errors
             if result.get("status") == "error":
+                err_msg = result.get("message", "")
+                if "401" in err_msg:
+                    logger.warning("[AGENT] token invalid (401) for expert=%s", real_name)
+                    return {"status": "token_invalid", "expert_name": real_name}
+
                 err_msg = result.get("message", "")
                 # Also check nested result field for [Execution Error] payloads
                 inner = result.get("result", "")
