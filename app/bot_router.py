@@ -214,7 +214,11 @@ async def _process(utg, bot, msg: dict, session):
         _user_tok_c = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
         _concept_text = await _get_cached_concept(bot.id, bot.preset_concept_id, _user_tok_c)
         if _is_agent_guide(_concept_text):
-            await _process_agentic(utg, bot, msg, text, _concept_text, exps, cid, session)
+            # Append file URL to text so the agent can pass it to experts
+            agent_text = text
+            if furl:
+                agent_text = f"{text}\n[{mt.upper()} URL: {furl}]"
+            await _process_agentic(utg, bot, msg, agent_text, _concept_text, exps, cid, session)
             return
 
     # ── SINGLE ROUTING DECISION ──────────────────────────────────────

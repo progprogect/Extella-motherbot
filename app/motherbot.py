@@ -10,6 +10,7 @@ from .crypto import encrypt_token, token_to_hash, decrypt_token
 from .config import settings
 from .key_manager import get_bot_keys, set_bot_key, build_expert_params
 from .preset_manager import create_or_update_preset_concept, search_concept_templates
+from .agentic_router import run_agentic_loop
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$")
@@ -609,9 +610,8 @@ async def _handle_api_key_input(cid, text, u, s):
 
 async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
     """Re-run the pending agentic message after the user provided a missing key."""
-    from .bot_router import _process_agentic, _get_cached_concept
-    from .agentic_router import _is_agent_guide
-
+    from .bot_router import _get_cached_concept
+    from .agentic_router import _is_agent_guide, run_agentic_loop
 
     pending_text = u.pending_agent_message
     agent_bot_id = u.pending_agent_bot_id
@@ -635,10 +635,8 @@ async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
         if not _is_agent_guide(concept_text):
             return
 
-        from .database import BotExpert
-        from sqlalchemy import select as sa_select
         exps = list((await s.execute(
-            sa_select(BotExpert).where(BotExpert.bot_id == bot.id, BotExpert.is_active == True)
+            select(BotExpert).where(BotExpert.bot_id == bot.id, BotExpert.is_active == True)
             .order_by(BotExpert.sort_order)
         )).scalars().all())
         if not exps:
@@ -647,8 +645,7 @@ async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
         # The child bot sends the reply to the user's Telegram ID (same as DM cid)
         child_bot_cid = u.telegram_id
         raw_bot_token = decrypt_token(bot.token_encrypted, settings.secret_key)
-        from .telegram_client import TelegramClient as TGClient
-        child_utg = TGClient(raw_bot_token)
+        child_utg = TelegramClient(raw_bot_token)
 
         await child_utg.send_chat_action(child_bot_cid, "typing")
 
@@ -656,7 +653,6 @@ async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
         openai_key = (all_keys.get("api_key") or all_keys.get("openai_api_key")
                       or settings.openai_api_key)
 
-        from .agentic_router import run_agentic_loop
         result = await run_agentic_loop(
             bot=bot,
             user_message=pending_text,
@@ -668,9 +664,9 @@ async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
             all_keys=all_keys,
         )
 
-        from .bot_router import _safe
+        from .bot_router import _safe as _route_safe
         if result.get("status") == "ok":
-            await child_utg.send_message(child_bot_cid, _safe(result.get("text", "\u2705 Done.")))
+            await child_utg.send_message(child_bot_cid, _route_safe(result.get("text", "\u2705 Done.")))
         elif result.get("status") in ("needs_device", "device_offline"):
             await child_utg.send_message(child_bot_cid,
                 "\U0001f4bb Your device is offline. Please open Extella Desktop and retry.")
@@ -681,7 +677,7 @@ async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
                 "Use /apikeys in the Motherbot to add it.")
         else:
             await child_utg.send_message(child_bot_cid,
-                f"\u26a0\ufe0f {_safe(result.get('message', 'Error replaying your request.'))}")
+                f"\u26a0\ufe0f {_route_safe(result.get('message', 'Error replaying your request.'))}")
 
     except Exception as e:
         logger.warning("[REPLAY] failed: %s", e)
