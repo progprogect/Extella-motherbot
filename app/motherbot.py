@@ -10,7 +10,7 @@ from .crypto import encrypt_token, token_to_hash, decrypt_token
 from .config import settings
 from .key_manager import get_bot_keys, set_bot_key, build_expert_params
 from .preset_manager import create_or_update_preset_concept, search_concept_templates
-from .agentic_router import run_agentic_loop
+from .agentic_router import run_agentic_loop, _is_agent_guide
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$")
@@ -611,7 +611,6 @@ async def _handle_api_key_input(cid, text, u, s):
 async def _replay_pending_agent_message(motherbot_cid: int, u, s) -> None:
     """Re-run the pending agentic message after the user provided a missing key."""
     from .bot_router import _get_cached_concept
-    from .agentic_router import _is_agent_guide, run_agentic_loop
 
     pending_text = u.pending_agent_message
     agent_bot_id = u.pending_agent_bot_id
