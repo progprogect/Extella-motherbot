@@ -1,20 +1,24 @@
 """
-Motherbot v11 — Clean Architecture
+Motherbot v12 — Local-Only Execution
 
 ROUTING DECISION (single path, no redundancy):
   1 expert  → skip routing, call directly
-  N experts + OpenAI key → orchestrator (parallel kwargs fetch)
+  N experts + OpenAI key → orchestrator v2 (preset concept context)
   N experts, no key     → semantic fallback
 
+EXECUTION: always local (user token + target device).
+  No device configured → needs_device response.
+  No serverless fallback.
+
 API calls per message:
-  Orchestrator path: N×get_kwargs (parallel) + 1×orchestrator + 1×expert = 3 round-trips
-  Semantic path:     1×search + 1×get_kwargs + 1×expert = 3 round-trips
-  No path runs both.
+  Orchestrator path: N×get_kwargs (parallel) + 1×orchestrator + 1×expert-local = 3 round-trips
+  Semantic path:     1×search + 1×get_kwargs + 1×expert-local = 3 round-trips
 """
 import asyncio
 import json
 import logging
 import re
+import time
 import ast as _ast
 from sqlalchemy import select
 
@@ -24,25 +28,40 @@ from .extella_client import ExtellaClient
 from .crypto import decrypt_token
 from .config import settings
 from .key_manager import build_expert_params
+from .preset_manager import fetch_concept_text
 from .mb_bot_manage import (
     handle_delete_confirm as _mgr_del,
     handle_edit_description as _mgr_edit,
 )
 
 logger = logging.getLogger(__name__)
-extella = ExtellaClient(settings.extella_token)
+
+# In-memory TTL cache for preset concepts: {(bot_id, concept_id): (text, expires_at)}
+_CONCEPT_CACHE: dict[tuple[int, int], tuple[str, float]] = {}
+_CONCEPT_TTL = 300  # 5 minutes
+
+
+async def _get_cached_concept(bot_id: int, concept_id: int, user_tok: str) -> str:
+    """Return concept text from cache or fetch from Extella (TTL=5 min)."""
+    key = (bot_id, concept_id)
+    cached = _CONCEPT_CACHE.get(key)
+    if cached and time.monotonic() < cached[1]:
+        return cached[0]
+    text = await fetch_concept_text(concept_id, user_tok) or ""
+    if text:
+        _CONCEPT_CACHE[key] = (text, time.monotonic() + _CONCEPT_TTL)
+    return text
+
+
+extella = ExtellaClient(settings.extella_token,
+                        profile_id="default",
+                        agent_id="agent_extella_default")
 
 _KEY_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}"
     r"|eyJ[A-Za-z0-9_.-]{30,}|aafd[A-Za-z0-9_-]{25,}"
     r"|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})"
 )
-_LOCAL_ERR = [
-    "no module named", "modulenotfounderror", "cannot identify image file",
-    "file not found", "no such file or directory", "permission denied",
-    "pillow", "opencv", "ffmpeg", "rembg", "ollama",
-    "browser", "playwright", "selenium", "connection refused",
-]
 _LANG = {
     "ru": "Respond only in Russian.", "en": "Respond only in English.",
     "de": "Respond only in German.", "fr": "Respond only in French.",
@@ -89,12 +108,6 @@ def _detect_lang(msg: dict) -> str:
         cyr = sum(1 for c in text if "\u0400" <= c <= "\u04FF")
         if cyr / max(len(text), 1) > 0.3: return "ru"
     return "en"
-
-
-def _is_local_error(r: dict) -> bool:
-    if r.get("status") != "error": return False
-    msg = r.get("message", "").lower()
-    return any(s in msg for s in _LOCAL_ERR)
 
 
 def _extract_text(inner) -> str:
@@ -203,8 +216,9 @@ async def _process(utg, bot, msg: dict, session):
     if isinstance(result, dict) and result.get("status") == "needs_device":
         exp_name = result.get("expert_name", best.display_name or best.expert_name)
         await utg.send_message(cid,
-            f"\u26a0\ufe0f <b>{exp_name}</b> requires your device to run.\n\n"
-            "Connect via /connect in @extnickbot_bot.")
+            f"\u26a0\ufe0f <b>Device not connected</b>\n\n"
+            f"Expert <b>{exp_name}</b> runs locally via Extella Desktop.\n\n"
+            "Please connect your device: send /connect to the Motherbot.")
         return
 
     # ── RESPONSE ─────────────────────────────────────────────────────
@@ -247,7 +261,7 @@ async def _route_and_build(bot, exps, text, mt, furl, lang, cid):
 
 async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
     """
-    Try GPT-4o-mini orchestrator.
+    Try mb_orchestrator_v2 with preset concept context.
     Fetches all expert kwargs IN PARALLEL (asyncio.gather).
     Returns (best, params) on success, None on timeout/error.
     """
@@ -271,15 +285,24 @@ async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
                 "kwargs": public,
             })
 
-        # Call orchestrator (15s timeout)
-        orch_resp = await extella.run_expert("mb_orchestrator", {
+        # Fetch preset concept text (cached, TTL 5 min)
+        preset_concept_text = ""
+        if bot.preset_concept_id and bot.user_extella_token_enc:
+            user_tok_for_concept = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+            preset_concept_text = await _get_cached_concept(
+                bot.id, bot.preset_concept_id, user_tok_for_concept
+            )
+
+        # Call orchestrator v2 with preset context (15s timeout)
+        orch_resp = await extella.run_expert("mb_orchestrator_v2", {
             "user_message": text,
             "experts_json": json.dumps(exp_info),
             "api_key": openai_key,
             "media_type": mt,
             "file_url": furl or "",
             "language": lang,
-        }, wait=True, timeout=15)
+            "preset_concept_text": preset_concept_text,
+        }, wait=True, timeout=20)
 
         # Parse response (Extella returns result as string or dict)
         inner = orch_resp.get("result", {})
@@ -323,8 +346,10 @@ async def _try_orchestrator(bot, exps, text, mt, furl, lang, cid, openai_key):
             params = {k: v for k, v in params.items()
                       if k in allowed or k in _INT}
 
-        logger.info("[ORCH] %s \u2192 %s | %s",
-                    text[:40], best.expert_name, inner.get("reasoning", "")[:60])
+        logger.info("[ORCH v2] %s → %s | conf=%.2f | %s",
+                    text[:40], best.expert_name,
+                    float(inner.get("confidence", 0)),
+                    inner.get("reasoning", "")[:60])
         return best, params
 
     except Exception as e:
@@ -404,25 +429,35 @@ def _build_params(bot, best, text: str, mt: str, furl,
 
 
 async def _execute(bot, best, params: dict) -> dict:
-    """Phase 1: serverless. Phase 2: device fallback on local error."""
-    result = await extella.run_expert(best.expert_name, params, wait=True, timeout=90)
+    """Local-only execution via user's Extella token + target device.
+    No serverless fallback — stability over convenience.
+    """
+    if not bot.user_extella_token_enc or not bot.user_target_id:
+        logger.warning("[EXEC] no device for bot %s expert %s", bot.id, best.expert_name)
+        return {"status": "needs_device",
+                "expert_name": best.display_name or best.expert_name}
 
-    if _is_local_error(result):
-        if bot.user_extella_token_enc:
-            logger.info("[EXEC] Phase 2 device fallback: %s", best.expert_name)
-            try:
-                user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
-                local_cli = ExtellaClient(user_tok)
-                result = await local_cli.run_expert(
-                    best.expert_name, params, wait=True, timeout=120)
-            except Exception as e:
-                logger.error("Phase 2 error: %s", e)
-        else:
-            return {
-                "status": "needs_device",
-                "expert_name": best.display_name or best.expert_name,
-            }
-    return result
+    user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+    local_cli = ExtellaClient(user_tok)  # no service-level X-Profile-Id/X-Agent-Id
+
+    for attempt in range(1, 3):
+        try:
+            result = await local_cli.run_expert(
+                best.expert_name, params,
+                target=bot.user_target_id, wait=True, timeout=120,
+            )
+            if result.get("status") == "error" and attempt < 2:
+                logger.warning("[EXEC] attempt %d error, retrying: %s | %s",
+                               attempt, best.expert_name, result.get("message", ""))
+                continue
+            logger.info("[EXEC] local ok: %s (attempt %d)", best.expert_name, attempt)
+            return result
+        except Exception as e:
+            logger.error("[EXEC] attempt %d exception: %s | %s", attempt, best.expert_name, e)
+            if attempt >= 2:
+                return {"status": "error", "message": str(e)}
+
+    return {"status": "error", "message": "Expert execution failed after retries"}
 
 
 async def _respond(utg, cid: int, result: dict, multi: bool, name: str):

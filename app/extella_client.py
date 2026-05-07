@@ -2,25 +2,26 @@ import httpx
 import logging
 logger = logging.getLogger(__name__)
 EXTELLA_BASE = "https://api.extella.ai"
-_PROFILE_ID = "default"
-_AGENT_ID   = "agent_extella_default"
 
-
-def _headers(token: str) -> dict:
-    return {
-        "X-Auth-Token": token,
-        "X-Profile-Id": _PROFILE_ID,
-        "X-Agent-Id":   _AGENT_ID,
-        "Content-Type": "application/json",
-    }
+def _headers(token: str, profile_id: str | None = None, agent_id: str | None = None) -> dict:
+    h = {"X-Auth-Token": token, "Content-Type": "application/json"}
+    if profile_id:
+        h["X-Profile-Id"] = profile_id
+    if agent_id:
+        h["X-Agent-Id"] = agent_id
+    return h
 
 
 class ExtellaClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str,
+                 profile_id: str | None = None,
+                 agent_id: str | None = None):
         self.token = token
+        self._profile_id = profile_id
+        self._agent_id = agent_id
 
     def _h(self) -> dict:
-        return _headers(self.token)
+        return _headers(self.token, self._profile_id, self._agent_id)
 
     async def get_expert_kwargs(self, name: str) -> set:
         """Returns set of kwarg names the expert accepts. Empty on error."""

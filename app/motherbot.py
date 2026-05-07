@@ -9,25 +9,15 @@ from .extella_client import ExtellaClient
 from .crypto import encrypt_token, token_to_hash, decrypt_token
 from .config import settings
 from .key_manager import get_bot_keys, set_bot_key
+from .preset_manager import create_or_update_preset_concept
 
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"^\d{8,12}:[A-Za-z0-9_-]{35,}$")
 motherbot = TelegramClient(settings.motherbot_token)
-extella = ExtellaClient(settings.extella_token)
+extella = ExtellaClient(settings.extella_token,
+                        profile_id="default",
+                        agent_id="agent_extella_default")
 
-_KNOWN_LOCAL = {
-    "image_enhance","improve_photo_quality","remove_background_local","remove_bg_local",
-    "video_enhance","video_upscale","text_to_speech","voice_clone_tortoise",
-    "transcribe_audio_file","audio_to_text_free","pdf_edit","edit_pdf",
-    "merge_pdf","split_pdf","organize_files","file_organizer","scan_folder",
-    "convert_file","file_converter","save_presentation_pptx","build_presentation",
-    "get_clipboard","read_local_file",
-}
-_LOCAL_SIGNALS = [
-    "pillow","opencv","ffmpeg","rembg","ollama","output_path",
-    "saves to","local file","no api key needed","no api key required",
-    "locally","local machine","subprocess","filesystem",
-]
 _EXTELLA_ABOUT = (
     "\U0001f916 <b>What is Extella?</b>\n"
     "Extella is an AI execution platform that runs AI experts on any machine \u2014 "
@@ -51,11 +41,9 @@ _DEPLOY_PROMPT = (
 )
 
 
-def _is_local(name: str, desc: str = "") -> bool:
-    if name.lower() in _KNOWN_LOCAL:
-        return True
-    t = (name + " " + (desc or "")).lower()
-    return any(w in t for w in _LOCAL_SIGNALS)
+def _is_local(*_) -> bool:
+    """All experts execute locally via Extella Desktop."""
+    return True
 
 
 def _clean_desc(desc: str) -> str:
@@ -77,12 +65,10 @@ def _build_expert_kb(exps: list, selected: set, bot_id: int) -> dict:
     rows = []
     for exp in exps:
         name = exp["name"]
-        local = _is_local(name, exp.get("description", ""))
-        badge = "\U0001f4bb" if local else "\u2601\ufe0f"
         check = "\u2705" if name in selected else "\u25fb\ufe0f"
         label = _clean_desc(exp.get("description", name))
         if len(label) > 36: label = label[:36] + "..."
-        rows.append([{"text": f"{check}{badge} {label}", "callback_data": f"exp|{name}|{bot_id}"}])
+        rows.append([{"text": f"{check}\U0001f4bb {label}", "callback_data": f"exp|{name}|{bot_id}"}])
     if selected:
         rows.append([{"text": "\U0001f680 Continue \u2192", "callback_data": f"activate|{bot_id}"}])
     else:
@@ -214,25 +200,18 @@ async def _handle_desc(cid, text, u, s):
         return
     bot.system_prompt = text
     await s.execute(delete(BotExpert).where(BotExpert.bot_id == bid))
-    local_count = 0
     for i, m in enumerate(matches):
         desc = m.get("description", m["name"])
-        is_loc = _is_local(m["name"], desc)
-        if is_loc: local_count += 1
         s.add(BotExpert(bot_id=bid, expert_name=m["name"],
                         display_name=_clean_desc(desc),
-                        exec_type="local" if is_loc else "cloud",
+                        exec_type="local",
                         params_json={"__prompt_param__": _detect_prompt_param(m["name"], desc)},
                         is_active=True, sort_order=i))
     await s.flush()
     u.state = "choosing_experts"; await s.flush()
     selected = {m["name"] for m in matches}
     exps_dicts = [{"name": m["name"], "description": m.get("description","")} for m in matches]
-    if local_count > 0:
-        legend = (f"\n\n\u2601\ufe0f = Extella cloud  \U0001f4bb = requires your device "
-                  f"({local_count} expert{'s' if local_count > 1 else ''})")
-    else:
-        legend = "\n\n\u2601\ufe0f All experts run on Extella cloud \u2014 no device setup needed!"
+    legend = "\n\n\U0001f4bb All experts run locally on your device via Extella"
     await motherbot.send_message(cid,
         f"\U0001f3af <b>Found {len(matches)} experts</b>{legend}\n\n"
         "All selected \u2705 \u2014 tap to deselect.\nReady? Press <b>\U0001f680 Continue</b>",
@@ -240,31 +219,22 @@ async def _handle_desc(cid, text, u, s):
 
 
 async def _show_execution_mode(cid, u, s, bot, exps):
-    cloud_exps = [e for e in exps if e.exec_type == "cloud"]
-    local_exps = [e for e in exps if e.exec_type == "local"]
-    if not local_exps:
-        await _do_activate(cid, u, s, bot, exps); return
-    local_names = ", ".join(f"<code>{e.expert_name}</code>" for e in local_exps[:3])
-    cloud_note = ""
-    if cloud_exps:
-        cloud_note = (f"\n\n\u2601\ufe0f <b>{len(cloud_exps)} cloud expert(s)</b> run on "
-                      "Extella servers automatically \u2014 no setup needed for those.")
+    if bot.user_extella_token_enc and bot.user_target_id:
+        await _do_activate(cid, u, s, bot, exps)
+        return
     u.state = "choosing_execution_mode"; u.pending_bot_id = bot.id; await s.flush()
     await motherbot.send_message(cid,
-        "\u2699\ufe0f <b>Runtime Setup Required</b>\n\n"
-        f"These experts need a local machine to run:\n{local_names}\n\n"
-        "They use libraries (image processors, AI models, file tools) "
-        f"that require a real machine environment.{cloud_note}\n\n"
+        "\u2699\ufe0f <b>Device Setup Required</b>\n\n"
+        "All experts run locally on your machine via Extella Desktop.\n\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         + _EXTELLA_ABOUT +
         "\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-        "Choose how to run your bot:",
+        "Choose how to connect:",
         reply_markup={"inline_keyboard": [
             [{"text": "\U0001f5a5 Option A \u2014 My Computer (Recommended)",
               "callback_data": f"mode_desktop|{bot.id}"}],
             [{"text": "\U0001f310 Option B \u2014 My Own Server",
               "callback_data": f"mode_server|{bot.id}"}],
-
         ]})
 
 
@@ -441,23 +411,6 @@ async def _mgr_edit_wrap(cid, text, u, s):
     await _mgr_edit(cid, text, u, s, bot, motherbot, extella,
         BotExpert, _is_local, _clean_desc, _detect_prompt_param, _build_expert_kb)
 
-
-async def _mgr_del_wrap(cid, text, u, s):
-    bid = u.pending_bot_id
-    if not bid: await motherbot.send_message(cid, '/start'); return
-    bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
-    if not bot: await motherbot.send_message(cid, '/start'); return
-    await _mgr_del(cid, text, u, s, bot, motherbot, extella,
-        TelegramClient, decrypt_token, BotExpert, settings)
-
-async def _mgr_edit_wrap(cid, text, u, s):
-    bid = u.pending_bot_id
-    if not bid: await motherbot.send_message(cid, '/start'); return
-    bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
-    if not bot: await motherbot.send_message(cid, '/start'); return
-    await _mgr_edit(cid, text, u, s, bot, motherbot, extella,
-        BotExpert, _is_local, _clean_desc, _detect_prompt_param, _build_expert_kb)
-
 async def _do_activate(cid, u, s, bot, exps, message_id=None):
     raw = decrypt_token(bot.token_encrypted, settings.secret_key)
     wh = await TelegramClient(raw).set_webhook(
@@ -468,15 +421,22 @@ async def _do_activate(cid, u, s, bot, exps, message_id=None):
     bot.webhook_url = f"{settings.railway_url}/bot/{bot.token_hash}/webhook"
     bot.is_active = True; u.state = "active"
     u.pending_bot_id = None; u.pending_key_name = None; await s.flush()
+
+    if bot.user_extella_token_enc:
+        user_tok = decrypt_token(bot.user_extella_token_enc, settings.secret_key)
+        concept_id = await create_or_update_preset_concept(bot, exps, user_tok)
+        if concept_id:
+            bot.preset_concept_id = concept_id
+            await s.flush()
     lines = []
     for e in exps:
-        tag = "\u2601\ufe0f" if e.exec_type == "cloud" else "\U0001f4bb"
-        lines.append(f"{tag} <b>{e.expert_name}</b>\n   {(e.display_name or '')[:70]}")
-    local_n = sum(1 for e in exps if e.exec_type == "local")
+        lines.append(f"\U0001f4bb <b>{e.expert_name}</b>\n   {(e.display_name or '')[:70]}")
     connect_note = ""
-    if local_n and not bot.user_target_id:
-        connect_note = (f"\n\n\u26a0\ufe0f <b>{local_n} expert(s) need a device (\U0001f4bb)</b>\n"
-                        "Use /connect to set up Extella Desktop or server.")
+    if not bot.user_target_id:
+        connect_note = (
+            "\n\n\u26a0\ufe0f <b>Device not connected!</b>\n"
+            "Use /connect to link Extella Desktop \u2014 required to run experts."
+        )
     text_msg = (f"\U0001f389 <b>@{bot.bot_username} is now live!</b>\n\n"
                 f"<b>Active experts ({len(exps)}):</b>\n\n"
                 + "\n\n".join(lines) + connect_note +
@@ -620,18 +580,16 @@ async def _handle_callback(cb: dict):
             exps = (await s.execute(select(BotExpert).where(
                 BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
             fl = "\n".join(
-                f"{'☁️' if e.exec_type=='cloud' else '💻'} {e.display_name or e.expert_name}"
+                f"\U0001f4bb {e.display_name or e.expert_name}"
                 for e in exps) or "\u2014"
             keys = get_bot_keys(bot, settings.secret_key)
             rows = [
                 [{"text": "✏️ Edit Functions", "callback_data": f"edit|{bid}"}],
-                [{"text": "✏️ Edit Functions", "callback_data": f"edit|{bid}"}],
                 [{"text": "\U0001f511 Manage API Keys", "callback_data": f"manage_keys|{bid}"}],
                 [{"text": "\U0001f517 Connect Device/Server",
                   "callback_data": f"mode_desktop|{bid}"}],
-                [{"text": "\U0001f5d1 Deactivate", "callback_data": f"deactivate|{bid}"}],
-                [{"text": "🗑 Delete Bot", "callback_data": f"delete_bot|{bid}"}],
-                [{"text": "🗑 Delete Bot", "callback_data": f"delete_bot|{bid}"}],
+                [{"text": "\u23f8\ufe0f Deactivate", "callback_data": f"deactivate|{bid}"}],
+                [{"text": "\U0001f5d1\ufe0f Delete Bot", "callback_data": f"delete_bot|{bid}"}],
             ]
             await motherbot.answer_callback_query(cbid)
             await motherbot.send_message(cid,
@@ -648,37 +606,6 @@ async def _handle_callback(cb: dict):
                 "\U0001f511 Send key: <code>name: value</code>",
                 reply_markup={"inline_keyboard": [[
                     {"text": "\u25c0\ufe0f Cancel", "callback_data": "cancel_key"}]]})
-        elif action == "edit" and len(parts) == 2:
-            bid = int(parts[1])
-            bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
-            if not bot or bot.user_telegram_id != tid:
-                await motherbot.answer_callback_query(cbid, 'Not found'); return
-            u.state = 'waiting_edit_description'; u.pending_bot_id = bid
-            await s.flush(); await motherbot.answer_callback_query(cbid)
-            exps = (await s.execute(select(BotExpert).where(
-                BotExpert.bot_id == bid, BotExpert.is_active == True))).scalars().all()
-            cur = ', '.join(e.display_name or e.expert_name for e in exps[:3])
-            em = '✏️ <b>Edit @' + bot.bot_username + '</b>' + chr(10) + chr(10)
-            em += 'Current: <i>' + cur + '</i>' + chr(10) + chr(10)
-            em += 'Describe new functionality:' + chr(10) + '✍️ <b>What should your bot do now?</b>'
-            await motherbot.send_message(cid, em)
-
-        elif action == "delete_bot" and len(parts) == 2:
-            bid = int(parts[1])
-            bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()
-            if not bot or bot.user_telegram_id != tid:
-                await motherbot.answer_callback_query(cbid, 'Not found'); return
-            u.state = 'waiting_delete_confirm'; u.pending_bot_id = bid
-            await s.flush(); await motherbot.answer_callback_query(cbid)
-            dm = '🗑 <b>Delete @' + bot.bot_username + '?</b>' + chr(10) + chr(10)
-            dm += 'Removes all settings and webhook.' + chr(10)
-            dm += 'You can recreate it with the same token later.' + chr(10) + chr(10)
-            dm += 'Type <b>yes, delete</b> to confirm:'
-            await motherbot.send_message(cid, dm,
-                reply_markup={'inline_keyboard': [[
-                    {'text': '❌ Cancel', 'callback_data': 'cancel_key'}
-                ]]})
-
         elif action == "edit" and len(parts) == 2:
             bid = int(parts[1])
             bot = (await s.execute(select(Bot).where(Bot.id == bid))).scalar_one_or_none()

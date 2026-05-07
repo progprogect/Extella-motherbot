@@ -47,6 +47,7 @@ class Bot(Base):
     # Local machine connection
     user_extella_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_target_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    preset_concept_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
         onupdate=datetime.utcnow)
@@ -58,7 +59,7 @@ class BotExpert(Base):
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     expert_name: Mapped[str] = mapped_column(String(100))
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    exec_type: Mapped[str] = mapped_column(String(10), default="cloud")
+    exec_type: Mapped[str] = mapped_column(String(10), default="local")
     trigger_type: Mapped[str] = mapped_column(String(20), default="any")
     trigger_value: Mapped[str | None] = mapped_column(String(100), nullable=True)
     params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -85,7 +86,8 @@ async def init_db():
             "ALTER TABLE bots ADD COLUMN IF NOT EXISTS user_api_keys_enc TEXT",
             "ALTER TABLE bots ADD COLUMN IF NOT EXISTS user_extella_token_enc TEXT",
             "ALTER TABLE bots ADD COLUMN IF NOT EXISTS user_target_id VARCHAR(100)",
-            "ALTER TABLE bot_experts ADD COLUMN IF NOT EXISTS exec_type VARCHAR(10) DEFAULT 'cloud'",
+            "ALTER TABLE bots ADD COLUMN IF NOT EXISTS preset_concept_id INTEGER",
+            "ALTER TABLE bot_experts ADD COLUMN IF NOT EXISTS exec_type VARCHAR(10) DEFAULT 'local'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_key_name VARCHAR(50)",
         ]:
             try:

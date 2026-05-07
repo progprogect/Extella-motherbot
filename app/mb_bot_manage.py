@@ -41,15 +41,12 @@ async def handle_edit_description(cid, text, u, s, bot_obj, motherbot, extella,
         return
     bot_obj.system_prompt = text
     await s.execute(sql_delete(BotExpert).where(BotExpert.bot_id == bot_obj.id))
-    local_count = 0
     for i, m in enumerate(matches):
         desc = m.get('description', m['name'])
-        is_loc = _is_local(m['name'], desc)
-        if is_loc: local_count += 1
         s.add(BotExpert(
             bot_id=bot_obj.id, expert_name=m['name'],
             display_name=_clean_desc(desc),
-            exec_type='local' if is_loc else 'cloud',
+            exec_type='local',
             params_json={'__prompt_param__': _detect_prompt_param(m['name'], desc)},
             is_active=True, sort_order=i))
     await s.flush()
@@ -57,11 +54,7 @@ async def handle_edit_description(cid, text, u, s, bot_obj, motherbot, extella,
     await s.flush()
     selected = {m['name'] for m in matches}
     ed = [{'name': m['name'], 'description': m.get('description', '')} for m in matches]
-    exp_word = 'experts' if local_count > 1 else 'expert'
-    if local_count > 0:
-        legend = chr(10) + chr(10) + '☁️ = cloud  💻 = device (' + str(local_count) + ' ' + exp_word + ')'
-    else:
-        legend = chr(10) + chr(10) + '☁️ All experts run on Extella cloud!'
+    legend = chr(10) + chr(10) + '\U0001f4bb All experts run locally on your device via Extella'
     hdr = f'🎯 <b>Found {len(matches)} experts</b>{legend}' + chr(10) + chr(10)
     hdr += 'All selected ✅ — tap to deselect.' + chr(10)
     hdr += 'Ready? Press <b>🚀 Continue</b>'
