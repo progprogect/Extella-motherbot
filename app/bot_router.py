@@ -463,11 +463,21 @@ async def _execute(bot, best, params: dict) -> dict:
                 logger.warning("[EXEC] device offline for bot %s: %s", bot.id, msg)
                 return {"status": "device_offline",
                         "expert_name": best.display_name or best.expert_name}
-            if result.get("status") == "error" and attempt < 2:
-                logger.warning("[EXEC] attempt %d error, retrying: %s | %s",
-                               attempt, best.expert_name, result.get("message", ""))
-                continue
-            logger.info("[EXEC] local ok: %s (attempt %d)", best.expert_name, attempt)
+            if result.get("status") == "error":
+                err_msg = result.get("message", "")
+                # Only retry on 5xx server errors or timeout — not on 4xx (wrong params)
+                is_retryable = (
+                    "timeout" in err_msg.lower()
+                    or any(f"HTTP {c}" in err_msg for c in ("500", "502", "503", "504"))
+                )
+                if is_retryable and attempt < 2:
+                    logger.warning("[EXEC] attempt %d retryable error, retrying: %s | %s",
+                                   attempt, best.expert_name, err_msg)
+                    continue
+                if not is_retryable:
+                    logger.warning("[EXEC] non-retryable error: %s | %s", best.expert_name, err_msg)
+                return result
+            logger.info("[EXEC] ok: %s (attempt %d)", best.expert_name, attempt)
             return result
         except Exception as e:
             logger.error("[EXEC] attempt %d exception: %s | %s", attempt, best.expert_name, e)

@@ -22,8 +22,12 @@ def _build_concept_text(system_prompt: str, experts: list) -> str:
     """Build the master concept text for a bot preset."""
     expert_lines = []
     for e in experts:
-        name = getattr(e, "expert_name", e.get("expert_name", "?"))
-        display = getattr(e, "display_name", e.get("display_name", "")) or name
+        if isinstance(e, dict):
+            name = e.get("expert_name", "?")
+            display = e.get("display_name", "") or name
+        else:
+            name = getattr(e, "expert_name", "?")
+            display = getattr(e, "display_name", "") or name
         expert_lines.append(f"  - {name}: {display[:120]}")
 
     experts_block = "\n".join(expert_lines) if expert_lines else "  (none configured)"
