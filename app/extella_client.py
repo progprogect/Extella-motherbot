@@ -52,6 +52,26 @@ class ExtellaClient:
             logger.warning("get_expert_params(%s): %s", name, e)
         return {}
 
+    async def get_expert_info(self, name: str) -> dict:
+        """Returns {"params": {param: default}, "description": str} in a single API call.
+        Returns empty dict on error so callers can treat missing info as unknown expert.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.post(
+                    f"{EXTELLA_BASE}/api/expert/get",
+                    headers=self._h(), json={"name": name},
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    return {
+                        "params": d.get("expert_params") or {},
+                        "description": (d.get("expert_description") or "").strip()[:500],
+                    }
+        except Exception as e:
+            logger.warning("get_expert_info(%s): %s", name, e)
+        return {}
+
     async def search_experts(self, query: str, limit: int = 15) -> list:
         """Semantic search across Extella expert library."""
         try:

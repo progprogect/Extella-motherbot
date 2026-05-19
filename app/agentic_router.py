@@ -129,9 +129,15 @@ def _build_retry_hint(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -> dict:
+def _build_tool_schema(
+    expert_name: str,
+    params: dict,
+    api_description: str = "",
+    display_name: str = "",
+) -> dict:
     """Convert Extella expert_params dict to an OpenAI function tool schema.
 
+    Description priority: api_description (from expert/get) → display_name → expert_name.
     Params whose names match _CONTENT_INPUT_PARAMS and have no meaningful
     default value are listed as required so the model always supplies them.
     """
@@ -160,7 +166,8 @@ def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -
 
     # OpenAI function names must be valid identifiers (no hyphens)
     fn_name = expert_name.replace("-", "_")
-    description = (display_name or f"Run {expert_name}")[:200]
+    # Use the richer API description when available; fall back to display name
+    description = (api_description or display_name or f"Run {expert_name}")[:300]
 
     return {
         "type": "function",
@@ -188,16 +195,18 @@ async def _fetch_expert_schemas(
     user_tok: str,
 ) -> dict[str, dict]:
     """
-    Fetch expert_params for all experts in parallel.
-    Returns {expert_name: {param_name: default_val}}.
-    Experts whose schema fetch fails (500, network error, empty result) are
-    excluded from the returned dict so they are not added as OpenAI tools.
+    Fetch full expert info for all experts in parallel using get_expert_info.
+
+    Returns {expert_name: {"params": {param: default}, "description": str}}.
+
+    Experts whose fetch fails (500, network error) or returns no params are
+    excluded from the result so they are not offered as OpenAI tools.
     """
     cli = ExtellaClient(user_tok, profile_id="default", agent_id="agent_extella_default")
 
     async def fetch_one(exp) -> tuple[str, dict]:
-        params = await cli.get_expert_params(exp.expert_name)
-        return exp.expert_name, params
+        info = await cli.get_expert_info(exp.expert_name)
+        return exp.expert_name, info
 
     results = await asyncio.gather(*[fetch_one(e) for e in experts], return_exceptions=True)
     out: dict[str, dict] = {}
@@ -206,11 +215,11 @@ async def _fetch_expert_schemas(
         if isinstance(item, Exception):
             logger.warning("[AGENT] fetch_expert_schemas error: %s", item)
             continue
-        name, params = item
-        if params:
-            out[name] = params
+        name, info = item
+        if info and info.get("params"):
+            out[name] = info
         else:
-            # Empty schema means expert/get returned 500 or expert doesn't exist
+            # No params → expert/get returned 500 or expert doesn't exist in this account
             skipped.append(name)
     if skipped:
         logger.warning("[AGENT] experts skipped (no schema / server error): %s", skipped)
@@ -251,11 +260,16 @@ async def run_agentic_loop(
     fn_to_expert: dict[str, str] = {}
 
     for exp in experts:
-        params = expert_schemas.get(exp.expert_name)
-        if not params:
+        info = expert_schemas.get(exp.expert_name)
+        if not info or not info.get("params"):
             logger.debug("[AGENT] skipping tool for %s (no schema)", exp.expert_name)
             continue
-        schema = _build_tool_schema(exp.expert_name, params, exp.display_name or "")
+        schema = _build_tool_schema(
+            exp.expert_name,
+            info["params"],
+            api_description=info.get("description", ""),
+            display_name=exp.display_name or "",
+        )
         tools.append(schema)
         fn_to_expert[schema["function"]["name"]] = exp.expert_name
 
@@ -313,7 +327,7 @@ async def run_agentic_loop(
                 fn_args = {}
 
             # Inject stored API keys the expert may need
-            allowed = set((expert_schemas.get(real_name) or {}).keys())
+            allowed = set(((expert_schemas.get(real_name) or {}).get("params") or {}).keys())
             for k, v in all_keys.items():
                 if k in allowed and k not in fn_args and v:
                     fn_args[k] = v
@@ -362,7 +376,7 @@ async def run_agentic_loop(
                 attempt = tool_error_counts.get(fn_name, 0)
                 tool_error_counts[fn_name] = attempt + 1
 
-                schema_params = expert_schemas.get(real_name) or {}
+                schema_params = (expert_schemas.get(real_name) or {}).get("params") or {}
                 req_params = [
                     p for p in schema_params
                     if p in _CONTENT_INPUT_PARAMS
