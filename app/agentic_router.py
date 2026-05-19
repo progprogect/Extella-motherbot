@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 6
+MAX_TOOL_RETRIES = 2  # max retries per individual tool before giving up on it
 
 # Patterns that indicate a missing / invalid API key in expert output
 _KEY_ERROR_PATTERNS = [
@@ -71,6 +72,61 @@ _CONTENT_INPUT_PARAMS = frozenset({
     "audio_url", "image_url", "input_url", "query", "question",
     "input_text", "content", "source_url",
 })
+
+
+def _build_retry_hint(
+    err_msg: str,
+    fn_args: dict,
+    expert_name: str,
+    attempt: int,
+    max_retries: int,
+    required_params: list[str],
+) -> str:
+    """
+    Build a structured error payload to return as a tool result.
+    When retries remain, includes an explicit instruction for the model to fix
+    and retry. When retries are exhausted, tells the model to use another tool.
+    """
+    low = err_msg.lower()
+    hints: list[str] = []
+
+    # Diagnose likely cause
+    if "500" in err_msg or "internal server error" in low:
+        if any(p for p in required_params if not fn_args.get(p)):
+            missing = [p for p in required_params if not fn_args.get(p)]
+            hints.append(
+                f"Required parameter(s) were empty or missing: {missing}. "
+                "Extract the correct value from the user's message and pass it."
+            )
+        else:
+            hints.append(
+                "The expert returned a server error (500). "
+                "This may be a temporary issue — retry with the same or slightly adjusted parameters."
+            )
+    elif "timeout" in low:
+        hints.append("The call timed out. Retry with a shorter/simpler input if possible.")
+    elif err_msg:
+        hints.append(f"Error detail: {err_msg[:200]}")
+
+    retries_left = max_retries - attempt
+    if retries_left > 0:
+        action = (
+            f"Retry this tool call with corrected parameters. "
+            f"You have {retries_left} retry attempt(s) remaining for this tool."
+        )
+    else:
+        action = (
+            "Maximum retries for this tool reached. "
+            "Do NOT call it again. Try a different tool or inform the user."
+        )
+
+    payload = {
+        "status": "error",
+        "message": err_msg[:200] if err_msg else "Unknown error",
+        "hint": " ".join(hints),
+        "action": action,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -> dict:
@@ -215,6 +271,10 @@ async def run_agentic_loop(
     logger.info("[AGENT] start | bot=%s | experts=%s | user_msg=%.80s",
                 bot.id, list(fn_to_expert.values()), user_message)
 
+    # Track how many times each tool has been called with an error response
+    # so the model gets a "give up on this tool" message after MAX_TOOL_RETRIES failures.
+    tool_error_counts: dict[str, int] = {}
+
     for iteration in range(MAX_ITERATIONS):
         try:
             response = await client.chat.completions.create(
@@ -273,19 +333,21 @@ async def run_agentic_loop(
             if result.get("status") in ("needs_device", "device_offline", "token_invalid"):
                 return result
 
-            # Detect missing key errors
+            # --- Error handling with retry feedback ---
             if result.get("status") == "error":
                 err_msg = result.get("message", "")
+
+                # 401 → token problem, surface immediately
                 if "401" in err_msg:
                     logger.warning("[AGENT] token invalid (401) for expert=%s", real_name)
                     return {"status": "token_invalid", "expert_name": real_name}
 
-                err_msg = result.get("message", "")
-                # Also check nested result field for [Execution Error] payloads
+                # Check nested result field for [Execution Error] payloads
                 inner = result.get("result", "")
                 if isinstance(inner, str) and "[Execution Error]" in inner:
                     err_msg = inner
 
+                # Missing API key → ask user
                 if _is_key_error(err_msg):
                     key_name = _extract_key_name(err_msg, real_name)
                     logger.warning("[AGENT] missing key=%s for expert=%s", key_name, real_name)
@@ -296,6 +358,36 @@ async def run_agentic_loop(
                         "error_detail": err_msg[:200],
                     }
 
+                # Retryable error (5xx, timeout) — give the model a diagnostic hint
+                attempt = tool_error_counts.get(fn_name, 0)
+                tool_error_counts[fn_name] = attempt + 1
+
+                schema_params = expert_schemas.get(real_name) or {}
+                req_params = [
+                    p for p in schema_params
+                    if p in _CONTENT_INPUT_PARAMS
+                    and (schema_params[p] is None or schema_params[p] == "")
+                ]
+                retry_content = _build_retry_hint(
+                    err_msg=err_msg,
+                    fn_args=fn_args,
+                    expert_name=real_name,
+                    attempt=attempt,
+                    max_retries=MAX_TOOL_RETRIES,
+                    required_params=req_params,
+                )
+                logger.warning(
+                    "[AGENT] tool error iter=%d attempt=%d/%d expert=%s | %s",
+                    iteration, attempt + 1, MAX_TOOL_RETRIES, real_name, err_msg[:100],
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": retry_content,
+                })
+                continue  # next tool_call in batch
+
+            # Success — append result normally
             result_content = json.dumps(result, ensure_ascii=False)[:4000]
             messages.append({
                 "role": "tool",
