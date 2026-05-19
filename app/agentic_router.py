@@ -64,9 +64,24 @@ def _extract_key_name(msg: str, expert_name: str = "") -> str:
     return "api_key"
 
 
+# Params whose names indicate they are the primary content input — treat as
+# required when no meaningful default is provided (empty string or None).
+_CONTENT_INPUT_PARAMS = frozenset({
+    "url", "prompt", "text", "input_path", "file_url", "video_url",
+    "audio_url", "image_url", "input_url", "query", "question",
+    "input_text", "content", "source_url",
+})
+
+
 def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -> dict:
-    """Convert Extella expert_params dict to an OpenAI function tool schema."""
+    """Convert Extella expert_params dict to an OpenAI function tool schema.
+
+    Params whose names match _CONTENT_INPUT_PARAMS and have no meaningful
+    default value are listed as required so the model always supplies them.
+    """
     properties: dict = {}
+    required_params: list[str] = []
+
     for pname, default_val in params.items():
         if pname.startswith("__"):
             continue  # skip internal params like __tg_bot_token__
@@ -81,6 +96,12 @@ def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -
             prop_type = "array"
         properties[pname] = {"type": prop_type}
 
+        # Mark as required if it is a content input param with no real default
+        if pname in _CONTENT_INPUT_PARAMS and (
+            default_val is None or default_val == "" or default_val == []
+        ):
+            required_params.append(pname)
+
     # OpenAI function names must be valid identifiers (no hyphens)
     fn_name = expert_name.replace("-", "_")
     description = (display_name or f"Run {expert_name}")[:200]
@@ -93,7 +114,7 @@ def _build_tool_schema(expert_name: str, params: dict, display_name: str = "") -
             "parameters": {
                 "type": "object",
                 "properties": properties,
-                "required": [],
+                "required": required_params,
             },
         },
     }
@@ -113,6 +134,8 @@ async def _fetch_expert_schemas(
     """
     Fetch expert_params for all experts in parallel.
     Returns {expert_name: {param_name: default_val}}.
+    Experts whose schema fetch fails (500, network error, empty result) are
+    excluded from the returned dict so they are not added as OpenAI tools.
     """
     cli = ExtellaClient(user_tok, profile_id="default", agent_id="agent_extella_default")
 
@@ -122,12 +145,19 @@ async def _fetch_expert_schemas(
 
     results = await asyncio.gather(*[fetch_one(e) for e in experts], return_exceptions=True)
     out: dict[str, dict] = {}
+    skipped: list[str] = []
     for item in results:
         if isinstance(item, Exception):
             logger.warning("[AGENT] fetch_expert_schemas error: %s", item)
             continue
         name, params = item
-        out[name] = params
+        if params:
+            out[name] = params
+        else:
+            # Empty schema means expert/get returned 500 or expert doesn't exist
+            skipped.append(name)
+    if skipped:
+        logger.warning("[AGENT] experts skipped (no schema / server error): %s", skipped)
     return out
 
 
@@ -158,13 +188,17 @@ async def run_agentic_loop(
     local_cli = ExtellaClient(user_tok, profile_id="default", agent_id="agent_extella_default")
     client = AsyncOpenAI(api_key=openai_key)
 
-    # Build OpenAI tools list
+    # Build OpenAI tools list — only include experts with a valid schema.
+    # Experts missing from expert_schemas had a 500/empty response and are skipped.
     tools: list[dict] = []
     # Map normalized OpenAI fn name → real Extella expert name
     fn_to_expert: dict[str, str] = {}
 
     for exp in experts:
-        params = expert_schemas.get(exp.expert_name, {})
+        params = expert_schemas.get(exp.expert_name)
+        if not params:
+            logger.debug("[AGENT] skipping tool for %s (no schema)", exp.expert_name)
+            continue
         schema = _build_tool_schema(exp.expert_name, params, exp.display_name or "")
         tools.append(schema)
         fn_to_expert[schema["function"]["name"]] = exp.expert_name
